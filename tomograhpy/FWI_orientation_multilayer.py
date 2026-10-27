@@ -83,9 +83,9 @@ RANKS     = 8              # MPI ranks per simulation job
 # =============================================================================
 
 # Stage centre frequency = alpha * CENTRAL_FREQUENCY; the mesh is built for alpha = 1
-CENTRAL_FREQUENCY      = 1e6                         # Ricker centre frequency at alpha = 1 [Hz]
-# dt = 1 / (250 f_c) = 4 ns must stay below the mesh CFL limit (~4.06 ns for the
-# 4-elements-per-wavelength mesh); checked against the mesh after it is built
+CENTRAL_FREQUENCY      = 2e6                         # Ricker centre frequency at alpha = 1 [Hz]
+# dt = 1 / (250 f_c) = 2 ns must stay below the mesh CFL limit (~2.19 ns for the
+# 4-elements-per-wavelength, 4 MHz mesh); checked against the mesh after it is built
 sampling_rate_in_hertz = CENTRAL_FREQUENCY * 250
 time_step_in_seconds   = 1 / sampling_rate_in_hertz  # solver/output time step [s]
 end_time               = 6e-6                        # simulation end time at alpha = 1 [s]
@@ -375,9 +375,9 @@ def save_paper_figure(fig, name, dpi=600):
 
 # Multiscale continuation: centre frequency = alpha * CENTRAL_FREQUENCY, low -> high.
 # alpha <= 1 keeps every stage within the mesh resolution (reference_frequency = 2 f_c).
-alpha_ls           = [0.4, 0.6, 0.8, 1.0]       # f_c = alpha * CENTRAL_FREQUENCY
+alpha_ls           = [0.2, 0.4, 0.6, 0.8, 1.0]  # f_c = alpha * CENTRAL_FREQUENCY (0.4 ... 2 MHz)
 # Simulation end time per stage: end_time is the alpha = 1 value, scaled with the period
-end_time_ls        = [end_time / alpha for alpha in alpha_ls]   # 15, 10, 7.5, 6 us
+end_time_ls        = [end_time / alpha for alpha in alpha_ls]   # 30, 15, 10, 7.5, 6 us
 MAX_ITER_PER_STAGE = 10                        # max accepted L-BFGS iterations per stage
 
 # Inverted region = the whole oriented stack (layers 1-5) as one theta(y) profile:
@@ -395,7 +395,7 @@ MODEL_SMOOTH_SIGMA   = 0.0                      # Gaussian smoothing of theta(y)
 
 # Gaussian smoothing of the UPDATE in y, built into the L-BFGS initial inverse Hessian.
 # sigma = UPDATE_SMOOTH_WAVELENGTHS * shear wavelength of the stage, i.e. scaled with the
-# resolution: 0.80 / 0.53 / 0.40 / 0.32 mm at 0.4 / 0.6 / 0.8 / 1.0 MHz. Measured in metres,
+# resolution: 0.80 / 0.40 / 0.27 / 0.20 / 0.16 mm at 0.4 / 0.8 / 1.2 / 1.6 / 2.0 MHz. In metres,
 # so it does not depend on the (non-uniform, 43-109 um) GLL y-level spacing.
 VS_0deg                   = np.sqrt(matl.C44 / matl.RHO)   # S velocity along symmetry axis [m/s]
 UPDATE_SMOOTH_WAVELENGTHS = 0.1                 # sigma / lambda_S
