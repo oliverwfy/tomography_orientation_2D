@@ -36,18 +36,24 @@ import xarray as xr
 # ── Configuration, project and mesh ───────────────────────────────────────
 
 # ---- Salvus site --------------------------------------------------------
-SITE_NAME = "oliver_wsl"
-# SITE_NAME = "isambard_oliver"
+import os as _os
+_ON_ISAMBARD = _os.environ.get('SCRATCH', '').startswith('/scratch')
 
 density_rxs = 15
 
-# # Directories in Windows
-PROJECT_DIR_WIN = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/Project'
-DATA_DIR_WIN = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/data/data'
-IMAGE_DIR_WIN = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/image'
-# PROJECT_DIR_WIN = '/scratch/b6as/oliverwfy.b6as/FWI_multilayers_full_aperture/Project'
-# DATA_DIR_WIN    = '/scratch/b6as/oliverwfy.b6as/FWI_multilayers_full_aperture/data'
-# IMAGE_DIR_WIN   = '/scratch/b6as/oliverwfy.b6as/FWI_multilayers_full_aperture/image'
+if _ON_ISAMBARD:
+    # Isambard AI HPC — store all large files on scratch (Lustre)
+    _BASE           = _os.environ['SCRATCH'] + f'/FWI_multilayers_{density_rxs}'
+    PROJECT_DIR_WIN = _BASE + '/Project'
+    DATA_DIR_WIN    = _BASE + '/data'
+    IMAGE_DIR_WIN   = _BASE + '/image'
+    SITE_NAME = "isambard_oliver"
+else:
+    # WSL / Windows
+    PROJECT_DIR_WIN = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/Project'
+    DATA_DIR_WIN    = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/data/data'
+    IMAGE_DIR_WIN   = fr'/mnt/f/Salvus_project/multilayer_{density_rxs}/image'
+    SITE_NAME = "oliver_wsl"
 
 
 RANKS = 8

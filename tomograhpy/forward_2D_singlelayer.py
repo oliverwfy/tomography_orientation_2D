@@ -18,6 +18,7 @@ FWI_orientation_single_layer.py and verify_kernel_C.py import this script.
 Units: SI throughout (m, s, Pa, kg/m^3); plots use mm.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -41,17 +42,28 @@ from material_ela_constants.Elastic_Material import *    # Austenite, ...
 # 1. Paths
 # =============================================================================
 
-# Directories on the WSL file system
-PROJECT_DIR = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/Project'
-IMAGE_DIR   = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/image'
-DATA_DIR    = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/data'
+_ON_ISAMBARD = os.environ.get('SCRATCH', '').startswith('/scratch')
 
-# Directories on the Windows drive (mounted in WSL) — used for the project and outputs
-PROJECT_DIR_WIN = '/mnt/f/Salvus_project/elastic_model/anisotropic/Project'
-DATA_DIR_WIN    = '/mnt/f/Salvus_project/elastic_model/anisotropic/data'
-IMAGE_DIR_WIN   = '/mnt/f/Salvus_project/elastic_model/anisotropic/image'
+if _ON_ISAMBARD:
+    # Isambard AI HPC — store all large files on scratch (Lustre)
+    _BASE           = os.environ['SCRATCH'] + '/Salvus_project/elastic_model/anisotropic'
+    PROJECT_DIR_WIN = _BASE + '/Project'
+    DATA_DIR_WIN    = _BASE + '/data'
+    IMAGE_DIR_WIN   = _BASE + '/image'
+else:
+    # WSL / Windows
+    # Directories on the WSL file system
+    PROJECT_DIR = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/Project'
+    IMAGE_DIR   = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/image'
+    DATA_DIR    = '/home/oliver/workspace/Salvus/elastic_model/anisotropic/data'
+    # Directories on the Windows drive (mounted in WSL) — used for the project and outputs
+    PROJECT_DIR_WIN = '/mnt/f/Salvus_project/elastic_model/anisotropic/Project'
+    DATA_DIR_WIN    = '/mnt/f/Salvus_project/elastic_model/anisotropic/data'
+    IMAGE_DIR_WIN   = '/mnt/f/Salvus_project/elastic_model/anisotropic/image'
+    for _d in (IMAGE_DIR, DATA_DIR):
+        Path(_d).mkdir(parents=True, exist_ok=True)
 
-for _d in (IMAGE_DIR, DATA_DIR, IMAGE_DIR_WIN, DATA_DIR_WIN):
+for _d in (IMAGE_DIR_WIN, DATA_DIR_WIN):
     Path(_d).mkdir(parents=True, exist_ok=True)
 
 # Project name (= folder name inside PROJECT_DIR_WIN)
@@ -62,7 +74,7 @@ PROJECT_NAME = "tomography_solid_orientation_singlelayer"
 # 2. Solver / compute site
 # =============================================================================
 
-SITE_NAME = "oliver_wsl"   # Salvus site to run simulations on
+SITE_NAME = "isambard_oliver" if _ON_ISAMBARD else "oliver_wsl"   # Salvus site to run simulations on
 RANKS     = 8              # MPI ranks per simulation job
 
 
