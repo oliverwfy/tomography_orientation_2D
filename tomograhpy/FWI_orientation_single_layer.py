@@ -109,7 +109,7 @@ STIFFNESS_PARAMETERS = {'C11', 'C12', 'C13', 'C22', 'C23', 'C33'}   # Salvus 2D 
 # Mesh resolution and absorbing boundaries
 # =============================================================================
 
-elements_per_wavelength = 5                       # elements per minimum wavelength
+elements_per_wavelength = 3                       # elements per minimum wavelength
 model_order             = 4                       # spectral-element polynomial order
 ab_reference_velocity   = VP_0deg                 # absorbing layer thickness measured in P wavelengths [m/s]
 reference_frequency     = CENTRAL_FREQUENCY * 2   # max frequency resolved by the mesh [Hz]
