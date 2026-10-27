@@ -22,7 +22,7 @@ Run from the tomograhpy folder:  python verify_kernel_C.py
 
 from scipy.spatial import cKDTree
 
-from FWI_2D_singlelayer import *   # model, mesh, project, initial model, gradients (cached)
+from tomograhpy.forward_2D_singlelayer import *   # model, mesh, project, initial model, gradients (cached)
 
 
 # =============================================================================
