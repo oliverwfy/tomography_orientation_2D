@@ -6,19 +6,20 @@ Usage
     from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
                                     SINGLE_COL, DOUBLE_COL, MM, C_OBS, C_SYN, C_TRUE, GRID_KW)
     apply_paper_style()                                    # once, before the first figure
-    fig, ax = plt.subplots(figsize=(SINGLE_COL, 3.0))
+    fig, ax = plt.subplots(figsize=PAPER_FIGSIZE)
     ...
     save_paper_figure(fig, IMAGE_DIR / "name")             # -> name.png (+ name.pdf if PDF is on)
 
 Rules (see CLAUDE.md, "Figures"):
-  * width SINGLE_COL (3.5 in) or DOUBLE_COL (7.0 in); never pass dpi to plt.subplots
+  * single-panel paper figures PAPER_FIGSIZE (SINGLE_COL x 3.0 in) so all share one size;
+    multi-panel width DOUBLE_COL (7.0 in); never pass dpi to plt.subplots
   * 8 pt text, 7 pt legends, inward ticks, no top/right spines (PAPER_RC)
   * axis labels "quantity (unit)" with math symbols: '$x$ (mm)', r'Time ($\\mu$s)', r'$\\theta$ (deg)'
   * lengths in mm (MM = 1e3), vertical axis labelled z
   * no figure titles for paper figures (caption instead); multi-panel figures get
     left-aligned panel labels '(a) ...', '(b) ...'
   * dense colour fields rasterized=True, colour bars via make_axes_locatable
-  * save with save_paper_figure: 300 dpi PNG; PDF (embedded fonts) only when turned on
+  * save with save_paper_figure: 300 dpi PNG (cropped to the content); PDF (embedded fonts) only when turned on
     (SAVE_PDF = True, or pdf=True for one figure)
 """
 
@@ -56,6 +57,7 @@ PAPER_RC = {
 SAVE_PDF = False                    # save_paper_figure writes a PDF too only when True
 
 SINGLE_COL, DOUBLE_COL = 3.5, 7.0   # journal column widths [in]
+PAPER_FIGSIZE = (SINGLE_COL, 3.0)  # every single-panel paper figure [in]
 MM = 1e3                            # m -> mm for plotting
 
 C_OBS, C_SYN, C_TRUE = 'red', '#0072B2', '#009E73'   # observed / synthetic / true-model curves
@@ -147,7 +149,7 @@ def plot_orientation_field(mesh, src_locations, rec_locations, extent, save_path
 
     tri = mtri.Triangulation(mesh.points[:, 0] * MM, mesh.points[:, 1] * MM)
 
-    fig, ax = plt.subplots(figsize=(SINGLE_COL, 3.0))
+    fig, ax = plt.subplots(figsize=PAPER_FIGSIZE)
     tp = ax.tripcolor(tri, theta_deg, cmap='viridis', vmin=0.0, vmax=90.0,
                       shading='gouraud', rasterized=True)
     add_colorbar(fig, ax, tp, r'$\theta$ (deg, clockwise from $+z$)')

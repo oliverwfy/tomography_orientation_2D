@@ -23,7 +23,7 @@ Metrics (inside the physical x range, rows exactly on an interface excluded):
 import numpy as np
 import matplotlib.pyplot as plt
 
-from my_code.plot_style import (apply_paper_style, save_paper_figure, SINGLE_COL, MM,
+from my_code.plot_style import (apply_paper_style, save_paper_figure, SINGLE_COL, PAPER_FIGSIZE, MM,
                                 C_SYN, C_TRUE, GRID_KW)
 
 
@@ -144,7 +144,7 @@ def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_coun
     plt.close(fig)
 
     # ── 2. final theta(z): recovered vs true vs starting ─────────────────────
-    fig, ax = plt.subplots(figsize=(SINGLE_COL, 3.2), layout='constrained')
+    fig, ax = plt.subplots(figsize=PAPER_FIGSIZE, layout='constrained')
     z_true = np.repeat([interfaces_y[0] + 1e-3] + list(interfaces_y) + [interfaces_y[-1] - 1e-3], 2)[1:-1]
     t_step = np.repeat([background_deg] + list(layer_angles_deg) + [background_deg], 2)
     ax.plot(t_step, z_true * MM, color=C_TRUE, lw=1.0, ls='--', label='True')
@@ -159,7 +159,7 @@ def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_coun
     plt.close(fig)
 
     # ── 3. per-layer recovery ────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(SINGLE_COL, 2.6), layout='constrained')
+    fig, ax = plt.subplots(figsize=PAPER_FIGSIZE, layout='constrained')
     k = np.arange(1, len(layer_rows) + 1)
     ax.bar(k - 0.18, [r[2] for r in layer_rows], width=0.36, color=C_TRUE, alpha=0.8, label='True')
     ax.bar(k + 0.18, [r[3] for r in layer_rows], width=0.36, color=C_SYN, alpha=0.8,

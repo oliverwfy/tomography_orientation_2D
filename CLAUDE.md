@@ -12,11 +12,13 @@ Do not define local rcParams, colour constants or save helpers; import them:
 ```python
 from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
                                 add_colorbar, plot_sources_receivers,
-                                SINGLE_COL, DOUBLE_COL, MM, C_OBS, C_SYN, C_TRUE, GRID_KW)
+                                SINGLE_COL, DOUBLE_COL, PAPER_FIGSIZE, MM, C_OBS, C_SYN, C_TRUE, GRID_KW)
 apply_paper_style()   # once, before the first figure
 ```
 
-- **Size**: width `SINGLE_COL` (3.5 in) or `DOUBLE_COL` (7.0 in); never pass `dpi` to `plt.subplots`.
+- **Size**: single-panel paper figures use `PAPER_FIGSIZE` (`SINGLE_COL` x 3.0 in), except the misfit and
+  model-error convergence figures (`SINGLE_COL` x 2.6 in); multi-panel figures width `DOUBLE_COL` (7.0 in); never pass `dpi` to `plt.subplots`
+  (`save_paper_figure` crops to the content; the misfit figure alone passes `dpi=600`).
 - **Style**: 8 pt text, 7 pt legends, inward ticks, no top/right spines (set by `apply_paper_style`).
 - **Labels**: "quantity (unit)" with math symbols: `'$x$ (mm)'`, `'$z$ (mm)'`, `r'Time ($\mu$s)'`,
   `r'$\theta$ (deg)'`, `'$u_z$ (m)'`. Lengths in mm (`MM = 1e3`); the vertical axis is **z**

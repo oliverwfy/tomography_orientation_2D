@@ -25,6 +25,7 @@ Units: SI throughout (m, s, Pa, kg/m^3); plots use mm.
 
 import copy
 import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,13 +69,23 @@ else:
 
 PROJECT_NAME = "tomography_solid_orientation_singlelayer"   # folder inside PROJECT_DIR_WIN
 
+FWI_IMAGE_DIR = Path(IMAGE_DIR_WIN) / "FWI_orientation_singlelayer"
+FWI_DATA_DIR  = Path(DATA_DIR_WIN) / "FWI_orientation_singlelayer"
+PAPER_FIG_DIR = FWI_IMAGE_DIR / "paper_figures"
+
+# Start every run from scratch: delete this script's previous data, images and Salvus project
+for _d in (FWI_IMAGE_DIR, FWI_DATA_DIR, Path(PROJECT_DIR_WIN, PROJECT_NAME)):
+    if _d.exists():
+        print(f"Deleting previous results: {_d}")
+        shutil.rmtree(_d)
+
 
 # =============================================================================
 # Solver / compute site
 # =============================================================================
 
 SITE_NAME = "isambard_oliver" if _ON_ISAMBARD else "oliver_wsl"   # Salvus site to run simulations on
-RANKS     = 8              # MPI ranks per simulation job
+RANKS     = 2              # MPI ranks per simulation job (the 2D mesh is only ~7k elements)
 
 
 # =============================================================================
@@ -329,9 +340,6 @@ print(f"{len(event_ls)} event(s) registered: {event_ls}")
 
 apply_paper_style()
 
-FWI_IMAGE_DIR = Path(IMAGE_DIR_WIN) / "FWI_orientation"
-FWI_DATA_DIR  = Path(DATA_DIR_WIN) / "FWI_orientation"
-PAPER_FIG_DIR = FWI_IMAGE_DIR / "paper_figures"
 for _d in (FWI_IMAGE_DIR, FWI_DATA_DIR, PAPER_FIG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
@@ -1007,18 +1015,18 @@ print(f"\nMulti-frequency FWI finished: {stage_summary}")
 # Summary figures and results
 # =============================================================================
 
-# ── Misfit vs iteration (log scale, one band per frequency stage) ───────────
+# ── Misfit chi vs iteration (log scale, one band per frequency stage) ──
 fig, ax = plt.subplots(figsize=(3.5, 2.6))
 for _k, (_alpha, _f_c, _n) in enumerate(stage_summary):
     _lo, _hi = stage_boundaries[_k] - 0.5, stage_boundaries[_k + 1] - 0.5
     if _k % 2 == 1:
         ax.axvspan(_lo, _hi, color='0.93', zorder=0, linewidth=0)
-    ax.text(0.5 * (_lo + _hi), 1.0, f"{_f_c / 1e6:.2f} MHz", transform=ax.get_xaxis_transform(),
+    ax.text(0.5 * (_lo + _hi), 1.0, f"{_f_c / 1e6:.1f} MHz", transform=ax.get_xaxis_transform(),
             ha='center', va='bottom', fontsize=7)
 ax.semilogy(np.arange(len(all_misfit_history)), all_misfit_history, color=C_SYN, marker='o',
             linewidth=1.0, markersize=3, markeredgecolor='black', markeredgewidth=0.4, zorder=3)
 ax.set_xlabel("FWI iteration")
-ax.set_ylabel("Misfit")
+ax.set_ylabel(r"$\chi$")
 ax.yaxis.grid(True, which='major', **GRID_KW)
 ax.set_axisbelow(True)
 fig.tight_layout(pad=0.3)

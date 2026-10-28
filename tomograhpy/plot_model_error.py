@@ -9,6 +9,7 @@ Run from the tomograhpy folder:
     python plot_model_error.py
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +23,15 @@ from my_code.model_error import save_model_error_figures
 # Run and true model (must match the FWI run that wrote DATA_DIR)
 # =============================================================================
 
-DATA_DIR  = Path('/mnt/f/Salvus_project/elastic_model/anisotropic/data/FWI_orientation_multilayer')
-IMAGE_DIR = Path('/mnt/f/Salvus_project/elastic_model/anisotropic/image/FWI_orientation_multilayer/paper_figures')
+if os.environ.get('SCRATCH', '').startswith('/scratch'):
+    _BASE = os.environ['SCRATCH'] + '/Salvus_project/elastic_model/anisotropic'   # Isambard AI
+else:
+    _BASE = '/mnt/f/Salvus_project/elastic_model/anisotropic'                    # WSL / Windows
 
-CENTRAL_FREQUENCY  = 1e6                                     # alpha = 1 centre frequency of that run [Hz]
+DATA_DIR  = Path(_BASE, 'data', 'FWI_orientation_multilayer')
+IMAGE_DIR = Path(_BASE, 'image', 'FWI_orientation_multilayer', 'paper_figures')
+
+CENTRAL_FREQUENCY  = 2e6                                     # alpha = 1 centre frequency of that run [Hz]
 x0, x1             = 0.0, 0.01                               # physical domain [m]
 BACKGROUND_ANGLE   = 45.0                                    # [deg]
 LAYER_INTERFACES_Y = [0.009, 0.007, 0.006, 0.0045, 0.002, 0.001]   # top to bottom [m]
