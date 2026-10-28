@@ -207,24 +207,30 @@ for k in KERNEL_PARAMETERS:
     print(f"{k:6s} {corr_all:10.5f} {corr_far:10.5f} {scale:12.5g} {rel_err:13.3e}")
 
 
-# side-by-side plots: Salvus | definition (scaled) | difference
-mm = 1e3
-tri = mtri.Triangulation(mesh_init.points[:, 0] * mm, mesh_init.points[:, 1] * mm)
-fig, axes = plt.subplots(len(KERNEL_PARAMETERS), 3, figsize=(12, 3.6 * len(KERNEL_PARAMETERS)), dpi=100)
-for row, k in zip(axes, KERNEL_PARAMETERS):
+# side-by-side plots: Salvus | definition (scaled) | difference (journal format, double column)
+from my_code.plot_style import apply_paper_style, save_paper_figure, DOUBLE_COL, MM
+
+apply_paper_style()
+tri = mtri.Triangulation(mesh_init.points[:, 0] * MM, mesh_init.points[:, 1] * MM)
+fig, axes = plt.subplots(len(KERNEL_PARAMETERS), 3, figsize=(DOUBLE_COL, 2.1 * len(KERNEL_PARAMETERS)),
+                         sharex=True, sharey=True, layout='constrained')
+for i, (row, k) in enumerate(zip(axes, KERNEL_PARAMETERS)):
     scale = results[k][2]
     fields = [gradient_salvus.element_nodal_fields[k], scale * kernel_def[k],
               gradient_salvus.element_nodal_fields[k] - scale * kernel_def[k]]
     vmax = np.percentile(np.abs(fields[0][inside]), 99.0)
-    for ax, f, title in zip(row, fields, ['Salvus', f'definition x {scale:.3g}', 'difference']):
+    for j, (ax, f, title) in enumerate(zip(row, fields, ['Salvus', f'definition $\\times$ {scale:.3g}',
+                                                         'difference'])):
         tp = ax.tripcolor(tri, elemental_nodal_to_nodal_field(f, mesh_init.connectivity),
-                          cmap='seismic', vmin=-vmax, vmax=vmax, shading='gouraud')
-        ax.set_title(f'K_{k} — {title}', fontsize=10)
-        ax.set_xlim(x0 * mm, x1 * mm)
-        ax.set_ylim(y0 * mm, y1 * mm)
+                          cmap='RdBu', vmin=-vmax, vmax=vmax, shading='gouraud', rasterized=True)
+        ax.set_title(f'({chr(97 + 3 * i + j)}) $K_{{{k}}}$, {title}', loc='left')
+        ax.set_xlim(x0 * MM, x1 * MM)
+        ax.set_ylim(y0 * MM, y1 * MM)
         ax.set_aspect('equal')
-        ax.set_xlabel('X (mm)')
-        ax.set_ylabel('Y (mm)')
-    plt.colorbar(tp, ax=row.tolist(), shrink=0.8)
-plt.savefig(Path(IMAGE_DIR_WIN) / 'kernel_C_verification.png', bbox_inches='tight')
+        if i == len(KERNEL_PARAMETERS) - 1:
+            ax.set_xlabel('$x$ (mm)')
+        if j == 0:
+            ax.set_ylabel('$z$ (mm)')
+    fig.colorbar(tp, ax=row.tolist(), shrink=0.8, label=f'$K_{{{k}}}$')
+save_paper_figure(fig, Path(IMAGE_DIR_WIN) / 'kernel_C_verification')
 plt.close(fig)

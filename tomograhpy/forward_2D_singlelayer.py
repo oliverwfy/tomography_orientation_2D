@@ -35,7 +35,11 @@ from salvus.material._details import material as md
 from salvus.toolbox.helpers.wavefield_output import wavefield_output_to_xarray
 
 from my_code.utilities import *                          # elemental_nodal_to_nodal_field, ...
+from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
+                                add_colorbar, plot_sources_receivers, SINGLE_COL, MM)
 from material_ela_constants.Elastic_Material import *    # Austenite, ...
+
+apply_paper_style()   # project journal figure format (my_code/plot_style.py)
 
 
 # =============================================================================
@@ -150,7 +154,7 @@ reference_velocity      = VS_min                  # size elements for the slowes
 ab_reference_velocity   = VP_0deg                 # absorbing layer thickness measured in P wavelengths [m/s]
 reference_frequency     = CENTRAL_FREQUENCY * 2   # max frequency resolved by the mesh [Hz]
 number_of_wavelengths   = 3                       # absorbing layer thickness (in wavelengths)
-free_surfaces           = False            # sides without absorbing layer
+free_surfaces           = ['y0', 'y1']            # sides without absorbing layer
 
 
 # =============================================================================
@@ -163,78 +167,6 @@ def oriented_material(material_unoriented, angle_in_degrees):
         angle_in_degrees=angle_in_degrees
     )
     return md.to_solver_form(material_unoriented.with_orientation(orientation), ndim=2)
-
-
-def orientation_from_stiffness(mesh):
-    """
-    Recover the nodal grain orientation from the meshed 2D stiffness tensor.
-
-    Uses the ClockwiseAngle convention (symmetry axis clockwise from +z).
-    Under a rotation by theta, C22 - C11 = D cos(2 theta) and
-    2 (C13 + C23) = D sin(2 theta), so theta follows from atan2 without the
-    unoriented reference tensor (works for inverted models too). Tensor
-    components, not angles, are averaged to the nodes, so it is wrap-safe.
-
-    Returns
-    -------
-    theta_deg : (n_nodes,) orientation in degrees, in [0, 180)
-    two_theta : (n_nodes,) doubled angle in radians (for smooth interpolation)
-    """
-    C = {
-        k: elemental_nodal_to_nodal_field(mesh.element_nodal_fields[k], mesh.connectivity)
-        for k in ['C11', 'C22', 'C13', 'C23']
-    }
-    two_theta = np.arctan2(2.0 * (C['C13'] + C['C23']), C['C22'] - C['C11'])
-    theta_deg = np.rad2deg(0.5 * two_theta) % 180.0
-    return theta_deg, two_theta
-
-
-def plot_orientation_field(mesh, src_locations, rec_locations, save_path=None,
-                           show_glyphs=False, n_glyphs=15):
-    """
-    Plot the orientation field of `mesh` in mm with sources and receivers.
-
-    show_glyphs : overlay line segments along the symmetry axis on an
-                  n_glyphs x n_glyphs grid.
-    """
-    mm = 1e3  # m -> mm
-
-    theta_deg, two_theta = orientation_from_stiffness(mesh)
-    print(f"Orientation range in model: {theta_deg.min():.2f} - {theta_deg.max():.2f} deg")
-
-    tri = mtri.Triangulation(mesh.points[:, 0] * mm, mesh.points[:, 1] * mm)
-
-    fig, ax = plt.subplots(figsize=(7, 6), dpi=100)
-    tp = ax.tripcolor(tri, theta_deg, cmap='viridis', vmin=0.0, vmax=90.0, shading='gouraud')
-    plt.colorbar(tp, ax=ax, label='Orientation (clockwise from +z) [deg]')
-
-    if show_glyphs:
-        # Interpolate cos/sin of 2*theta on a regular grid, then halve the angle
-        xg, yg = np.meshgrid(np.linspace(x0 * mm, x1 * mm, n_glyphs)[1:-1],
-                             np.linspace(y0 * mm, y1 * mm, n_glyphs)[1:-1])
-        c2 = mtri.LinearTriInterpolator(tri, np.cos(two_theta))(xg, yg)
-        s2 = mtri.LinearTriInterpolator(tri, np.sin(two_theta))(xg, yg)
-        theta_g = 0.5 * np.arctan2(s2, c2)
-        ax.quiver(xg, yg, np.sin(theta_g), np.cos(theta_g),
-                  pivot='middle', headwidth=0, headlength=0, headaxislength=0,
-                  color='k', scale=25, width=0.004)
-
-    ax.scatter(src_locations[:, 0] * mm, src_locations[:, 1] * mm,
-               marker='v', color='red', s=60, zorder=5, label='Source')
-    ax.scatter(rec_locations[:, 0] * mm, rec_locations[:, 1] * mm,
-               marker='^', color='green', s=40, zorder=5, label='Receiver')
-
-    ax.set_xlabel('X (mm)')
-    ax.set_ylabel('Y (mm)')
-    ax.set_title('True (layered) model — grain orientation')
-    ax.set_xlim(x0 * mm, x1 * mm)
-    ax.set_ylim(y0 * mm, y1 * mm)
-    ax.set_aspect('equal')
-    ax.legend(fontsize=8, loc='upper right')
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path)
-    plt.close(fig)
 
 
 def forward_simulation(simulation_name, events,
@@ -341,12 +273,11 @@ def orientation_kernel(gradient_mesh, model_mesh, matl):
     return sum(gradient_mesh.element_nodal_fields[k] * dC[k] for k in dC)
 
 
-def plot_kernel(mesh, kernel, src_locations, rec_locations, title, label, save_path=None,
-                clip_percentile=99.0):
-    """Plot an element-nodal kernel in mm with a symmetric colour scale."""
-    mm = 1e3
+def plot_kernel(mesh, kernel, src_locations, rec_locations, label, save_path=None,
+                clip_percentile=99.0, title=None):
+    """Plot an element-nodal kernel in mm with a symmetric colour scale (journal format)."""
     k_nodal = elemental_nodal_to_nodal_field(kernel, mesh.connectivity)
-    tri = mtri.Triangulation(mesh.points[:, 0] * mm, mesh.points[:, 1] * mm)
+    tri = mtri.Triangulation(mesh.points[:, 0] * MM, mesh.points[:, 1] * MM)
 
     # colour limit from the physical domain only (exclude the absorbing layer);
     # 99th percentile so the source/receiver singularities do not saturate it
@@ -354,25 +285,23 @@ def plot_kernel(mesh, kernel, src_locations, rec_locations, title, label, save_p
               (mesh.points[:, 1] >= y0) & (mesh.points[:, 1] <= y1))
     vmax = np.percentile(np.abs(k_nodal[inside]), clip_percentile)
 
-    fig, ax = plt.subplots(figsize=(7, 6), dpi=100)
-    tp = ax.tripcolor(tri, k_nodal, cmap='seismic', vmin=-vmax, vmax=vmax, shading='gouraud')
-    plt.colorbar(tp, ax=ax, label=label)
+    fig, ax = plt.subplots(figsize=(SINGLE_COL, 3.0))
+    tp = ax.tripcolor(tri, k_nodal, cmap='RdBu', vmin=-vmax, vmax=vmax, shading='gouraud',
+                      rasterized=True)
+    add_colorbar(fig, ax, tp, label)
     for y_if in (LAYER_TOP_Y, LAYER_BOTTOM_Y):
-        ax.axhline(y_if * mm, color='k', lw=0.8, ls='--')
-    ax.scatter(src_locations[:, 0] * mm, src_locations[:, 1] * mm,
-               marker='v', color='red', s=60, zorder=5, label='Source')
-    ax.scatter(rec_locations[:, 0] * mm, rec_locations[:, 1] * mm,
-               marker='^', color='green', s=40, zorder=5, label='Receiver')
-    ax.set_xlabel('X (mm)')
-    ax.set_ylabel('Y (mm)')
-    ax.set_title(title)
-    ax.set_xlim(x0 * mm, x1 * mm)
-    ax.set_ylim(y0 * mm, y1 * mm)
+        ax.axhline(y_if * MM, color='k', lw=0.6, ls='--')
+    plot_sources_receivers(ax, src_locations, rec_locations)
+    ax.set_xlabel('$x$ (mm)')
+    ax.set_ylabel('$z$ (mm)')
+    if title:
+        ax.set_title(title)
+    ax.set_xlim(x0 * MM, x1 * MM)
+    ax.set_ylim(y0 * MM, y1 * MM)
     ax.set_aspect('equal')
-    ax.legend(fontsize=8, loc='upper right')
-    plt.tight_layout()
+    fig.tight_layout(pad=0.3)
     if save_path is not None:
-        plt.savefig(save_path)
+        save_paper_figure(fig, save_path)
     plt.close(fig)
 
 
@@ -490,10 +419,11 @@ print(f"All {len(event_ls)} events registered: {event_ls}")
 # Plot true orientation field
 # =============================================================================
 
-plot_orientation_field(
-    mesh, tx_locations, r_loc_all,
-    save_path=Path(IMAGE_DIR_WIN) / 'true_model_orientation_field.png',
+fig, _ = plot_orientation_field(
+    mesh, tx_locations, r_loc_all, extent=(x0, x1, y0, y1),
+    save_path=Path(IMAGE_DIR_WIN) / 'true_model_orientation_field',
 )
+plt.close(fig)
 
 
 # =============================================================================
@@ -595,7 +525,6 @@ K_theta = orientation_kernel(gradient_C, mesh_init, matl)
 
 plot_kernel(
     mesh_init, K_theta, tx_locations, r_loc_all,
-    title=r'Sensitivity kernel $K_\theta$ (initial model)',
-    label=r'$K_\theta$ [per rad]',
-    save_path=Path(IMAGE_DIR_WIN) / 'kernel_theta.png',
+    label=r'$K_\theta$ (rad$^{-1}$)',
+    save_path=Path(IMAGE_DIR_WIN) / 'kernel_theta',
 )

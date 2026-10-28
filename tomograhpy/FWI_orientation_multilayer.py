@@ -44,6 +44,9 @@ import salvus.namespace as sn
 from salvus.material._details import material as md
 
 from my_code.utilities import elemental_nodal_to_nodal_field
+from my_code.model_error import save_model_error_figures
+from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
+                                C_OBS, C_SYN, C_TRUE, GRID_KW, MM as mm)
 from material_ela_constants.Elastic_Material import Austenite
 
 
@@ -329,31 +332,11 @@ print(f"{len(event_ls)} event(s) registered: {event_ls}")
 
 
 # =============================================================================
-# Figure style (same journal style as the acoustic FWI script)
+# Figure style (project journal format, my_code/plot_style.py) and the
+# simulation configuration: true orientation field with source and receivers
 # =============================================================================
 
-plt.rcParams.update({
-    'font.size': 8,
-    'axes.labelsize': 8,
-    'axes.titlesize': 8,
-    'xtick.labelsize': 8,
-    'ytick.labelsize': 8,
-    'legend.fontsize': 7,
-    'axes.linewidth': 0.6,
-    'xtick.direction': 'in',
-    'ytick.direction': 'in',
-    'xtick.major.width': 0.6,
-    'ytick.major.width': 0.6,
-    'axes.spines.top': False,
-    'axes.spines.right': False,
-    'pdf.fonttype': 42,   # embed TrueType fonts (journal requirement)
-    'ps.fonttype': 42,
-    'savefig.dpi': 300,
-})
-
-C_OBS, C_SYN, C_TRUE = 'red', '#0072B2', '#009E73'   # observed / synthetic / true-model curves
-GRID_KW = dict(linewidth=0.4, color='0.85')
-mm = 1e3   # m -> mm for plotting
+apply_paper_style()
 
 FWI_IMAGE_DIR = Path(IMAGE_DIR_WIN) / "FWI_orientation_multilayer"
 FWI_DATA_DIR  = Path(DATA_DIR_WIN) / "FWI_orientation_multilayer"
@@ -361,13 +344,9 @@ PAPER_FIG_DIR = FWI_IMAGE_DIR / "paper_figures"
 for _d in (FWI_IMAGE_DIR, FWI_DATA_DIR, PAPER_FIG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-
-def save_paper_figure(fig, name, dpi=600):
-    """Save `fig` as PAPER_FIG_DIR/<name>.pdf and <name>.png."""
-    fig.savefig(PAPER_FIG_DIR / f"{name}.pdf", dpi=dpi)
-    fig.savefig(PAPER_FIG_DIR / f"{name}.png", dpi=dpi)
-    print(f"Saved {PAPER_FIG_DIR / name}.pdf / .png")
-
+fig, _ = plot_orientation_field(mesh, tx_locations, r_loc_all, extent=(x0, x1, y0, y1),
+                                save_path=PAPER_FIG_DIR / "FWI_orientation_configuration")
+plt.close(fig)
 
 # =============================================================================
 # FWI settings
@@ -568,7 +547,7 @@ def _kernel_axes(ax, K, xs, ys, title, xlim, ylim, label):
     vmax = np.percentile(np.abs(K), 99.0) or 1.0
     tp = ax.tripcolor(xs * mm, ys * mm, K, cmap='RdBu', shading='gouraud',
                       vmin=-vmax, vmax=vmax, rasterized=True)
-    ax.set_xlabel('$x$ (mm)'); ax.set_ylabel('$y$ (mm)')
+    ax.set_xlabel('$x$ (mm)'); ax.set_ylabel('$z$ (mm)')
     ax.set_title(title)
     ax.set_xlim(*[v * mm for v in xlim]); ax.set_ylim(*[v * mm for v in ylim])
     ax.set_aspect('equal')
@@ -657,7 +636,7 @@ def plot_theta_model(theta_nodal, it, ls):
     tp = axes[0].tripcolor(_x * mm, _y * mm, np.rad2deg(theta_nodal), cmap='viridis',
                            vmin=0.0, vmax=90.0, shading='gouraud', rasterized=True)
     fig.colorbar(tp, ax=axes[0], label=r'$\theta$ (deg)', shrink=0.9)
-    axes[0].set_xlabel('$x$ (mm)'); axes[0].set_ylabel('$y$ (mm)')
+    axes[0].set_xlabel('$x$ (mm)'); axes[0].set_ylabel('$z$ (mm)')
     axes[0].set_title(rf'(a) $\theta$ field (iteration {it}, ls {ls})')
     axes[0].set_xlim(x0 * mm, x1 * mm); axes[0].set_ylim(y0 * mm, y1 * mm)
     axes[0].set_aspect('equal')
@@ -666,8 +645,8 @@ def plot_theta_model(theta_nodal, it, ls):
     axes[1].plot(np.rad2deg(_theta_profile(theta_nodal)), _y_levels * mm,
                  color=C_SYN, marker='o', markersize=2, lw=1.0, label='Current')
     axes[1].axhspan(y0_roi * mm, y1_roi * mm, color='0.93', zorder=0, lw=0)
-    axes[1].set_xlabel(r'$\theta$ (deg)'); axes[1].set_ylabel('$y$ (mm)')
-    axes[1].set_title(rf'(b) $\theta(y)$ profile (iteration {it}, ls {ls})')
+    axes[1].set_xlabel(r'$\theta$ (deg)'); axes[1].set_ylabel('$z$ (mm)')
+    axes[1].set_title(rf'(b) $\theta(z)$ profile (iteration {it}, ls {ls})')
     axes[1].set_ylim(y0 * mm, y1 * mm)
     axes[1].legend(frameon=False)
     axes[1].grid(True, **GRID_KW)
@@ -1170,31 +1149,10 @@ ax.yaxis.grid(True, which='major', **GRID_KW)
 ax.set_axisbelow(True)
 fig.tight_layout(pad=0.3)
 plt.savefig(FWI_IMAGE_DIR / "misfit_history_multiscale.png")
-save_paper_figure(fig, "FWI_orientation_misfit_vs_iteration")
+save_paper_figure(fig, PAPER_FIG_DIR / "FWI_orientation_misfit_vs_iteration", dpi=600)
 plt.close(fig)
 
-# ── Recovered theta(y) vs. true and starting profiles ───────────────────────
 _all_model_history = np.concatenate(all_model_history, axis=0)
-_t_final = _theta_bg_nodal.copy()
-_t_final[roi_mask] = _all_model_history[-1]
-fig, ax = plt.subplots(figsize=(3.5, 3.0))
-ax.axhspan(y0_roi * mm, y1_roi * mm, color='0.93', zorder=0, lw=0, label='ROI')
-for _y_if in LAYER_INTERFACES_Y:   # true interfaces (not used by the inversion)
-    ax.axhline(_y_if * mm, color='0.6', lw=0.4, ls=':', zorder=1)
-ax.plot(np.rad2deg(_theta_profile(_theta_true_nodal)), _y_levels * mm, color=C_TRUE, lw=1.0,
-        ls='--', label='True')
-ax.plot(np.rad2deg(_theta_profile(_theta_bg_nodal)), _y_levels * mm, color='0.5', lw=0.8,
-        ls=':', label='Starting')
-ax.plot(np.rad2deg(_theta_profile(_t_final)), _y_levels * mm, color=C_SYN, lw=1.0,
-        marker='o', markersize=2, label='Recovered')
-ax.set_xlabel(r'$\theta$ (deg)'); ax.set_ylabel('$y$ (mm)')
-ax.set_ylim(y0 * mm, y1 * mm)
-ax.legend(frameon=False, loc='upper right')
-ax.grid(True, **GRID_KW)
-fig.tight_layout(pad=0.3)
-plt.savefig(FWI_IMAGE_DIR / "theta_profile_final.png")
-save_paper_figure(fig, "FWI_orientation_theta_profile")
-plt.close(fig)
 
 # ── Combined histories ──────────────────────────────────────────────────────
 np.save(FWI_DATA_DIR / "misfit_history_multiscale.npy", np.array(all_misfit_history))
@@ -1209,3 +1167,11 @@ np.savez(FWI_DATA_DIR / "observed_signal_history_multiscale.npz",
          **dict(zip(_stage_keys, all_observed_history)))
 print(f"Saved misfit/model/synthetic/adjoint histories ({len(all_misfit_history)} entries) "
       f"and observed traces ({len(all_observed_history)} stage(s)) to {FWI_DATA_DIR}")
+
+
+# ── Model error vs the true model (RMS / relative theta error, profile, layers) ──
+save_model_error_figures(
+    _all_model_history, np.column_stack([_x_roi, _y_roi]), alpha_ls, np.diff(stage_boundaries),
+    CENTRAL_FREQUENCY, LAYER_INTERFACES_Y, LAYER_ANGLES_DEG, BACKGROUND_ANGLE_DEG, (x0, x1),
+    PAPER_FIG_DIR,
+)

@@ -463,14 +463,14 @@ class VoronoiGrainIndexer:
         if save_path:
             Image.fromarray(overlay).save(str(save_path))
         else:
-            plt.figure(figsize=(6,6))
-            plt.title("Image with Boundaries")
+            from my_code.plot_style import apply_paper_style, SINGLE_COL   # lazy: plot_style imports utilities
+            apply_paper_style()
+            plt.figure(figsize=(SINGLE_COL, SINGLE_COL))
             plt.imshow(overlay)
             plt.axis("off")
             plt.show()
 
-    def plot_bar_chart(self, save_path: str | Path = None,
-                    title: str = "Equivalent Circle Radius of Regions") -> None:
+    def plot_bar_chart(self, save_path: str | Path = None, title: str = None) -> None:
         """
         Show or save bar chart of equivalent radii (normalized true area=1).
         """
@@ -484,17 +484,20 @@ class VoronoiGrainIndexer:
         labels = list(range(len(equi_r)))
         colors = (self.kept_colors_sorted / 255.0)
 
-        plt.figure(figsize=(8, 6))
+        from my_code.plot_style import apply_paper_style, save_paper_figure, SINGLE_COL   # lazy import
+        apply_paper_style()
+        fig = plt.figure(figsize=(SINGLE_COL, 2.6))
         plt.bar(labels, equi_r, color=colors)
-        plt.ylabel("Equivalent Radius (normalized units)")
-        plt.xlabel("Region Index (sorted by area)")
-        plt.title(title)
+        plt.ylabel("Equivalent radius (normalised)")
+        plt.xlabel("Region index (sorted by area)")
+        if title:
+            plt.title(title)
         plt.xticks(labels)
-        plt.tight_layout()
+        plt.tight_layout(pad=0.3)
 
         if save_path:
-            plt.savefig(str(save_path))
-            plt.close()
+            save_paper_figure(fig, save_path)
+            plt.close(fig)
         else:
             plt.show()
 
