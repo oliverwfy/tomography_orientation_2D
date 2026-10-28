@@ -19,12 +19,14 @@ Acquisition: as FWI_orientation_multilayer.py - one source (vertical force) at (
 top free surface, 9 receivers at x = 1 ... 9 mm on the bottom free surface (free surfaces y0, y1;
 absorbing left / right).
 
-Defects from RTM.py (domain 100 m -> 10 mm, scale 1e-4):
+Defects: point scatterers at the RTM.py positions (domain 100 m -> 10 mm, scale 1e-4):
   * centres x = linspace(20, 80, 4), y = linspace(20, 75, 4) m -> mm / 10
-  * radius DEFECT_RADIUS = 0.25 mm (below the ~0.4 mm element size): the defect is set on the
-    GLL nodes inside the circle, not on whole elements, so it keeps its size and shape
-  * contrast: RTM.py adds 3000 m/s to 1400 m/s (velocity x 3.14) at fixed density; here all
-    stiffness components are scaled by DEFECT_VELOCITY_FACTOR^2 at fixed density
+  * point scatterer: only the GLL node nearest each centre is perturbed (with its copies in the
+    neighbouring elements); the GLL spacing (~0.05-0.13 mm) is < lambda_S / 20 at 1 MHz
+  * contrast: an impedance scatterer - all stiffness components AND the density are scaled by
+    the same DEFECT_IMPEDANCE_FACTOR (10): velocities sqrt(C / rho) stay those of the background
+    (no CFL / wavelength change), impedance sqrt(rho C) x 10, normal-incidence R = 9/11 = 0.82
+    (stronger than RTM.py's velocity-only scatterer, vp x 3.14 at fixed rho: R = 0.52)
 
 Run from the tomograhpy folder (after FWI_orientation_multilayer.py has saved its histories):
     python RTM_orientation.py
@@ -96,9 +98,8 @@ LAYER_INTERFACES_Y   = [0.009, 0.007, 0.006, 0.0045, 0.002, 0.001]   # top to bo
 LAYER_ANGLES_DEG     = [70.0, 30.0, 60.0, 20.0, 40.0]               # layers 1-5
 
 DOMAIN_SCALE           = 1e-4                                   # RTM.py metres -> here metres (100 m -> 10 mm)
-DEFECT_CENTERS         = np.column_stack([np.linspace(20, 80, 4), np.linspace(20, 75, 4)]) * DOMAIN_SCALE
-DEFECT_RADIUS          = 0.25e-3                                # [m], set on GLL nodes (see header)
-DEFECT_VELOCITY_FACTOR = (1400.0 + 3000.0) / 1400.0             # RTM.py: vp 1400 -> 4400 m/s
+DEFECT_CENTERS         = np.column_stack([np.linspace(20, 80, 4), np.linspace(15, 75, 4)]) * DOMAIN_SCALE
+DEFECT_IMPEDANCE_FACTOR = 10.0                                  # stiffness AND density x this (velocity unchanged)
 
 MIGRATION_MODELS = ['reconstructed', 'true', 'homogeneous']     # 'reconstructed' is the target
 
@@ -213,20 +214,24 @@ mesh_true = lm.mesh_from_domain(domain=domain,
                                 mesh_resolution=mesh_res)
 print(f"True mesh: {mesh_true.nelem} elements")
 
-# defects: GLL nodes inside a circle -> all stiffness x factor^2 (velocity x factor); node-wise,
-# so defects smaller than an element keep their size (an element-centroid test would miss them)
+# point scatterers: the GLL node nearest each centre (all its element copies) gets all stiffness
+# AND the density x factor (impedance x factor, velocity unchanged); neighbours keep the background
 mesh_defects = mesh_true.copy()
 _nodes = mesh_defects.get_element_nodes()                       # (nelem, n_gll, 2)
 defect_mask = np.zeros(_nodes.shape[:2], dtype=bool)
+defect_nodes = []
 for c in DEFECT_CENTERS:
-    inside_c = np.linalg.norm(_nodes - c, axis=-1) < DEFECT_RADIUS
-    assert inside_c.any(), f"defect at {c * MM} mm contains no GLL node: increase DEFECT_RADIUS"
-    defect_mask |= inside_c
-for k in STIFFNESS_PARAMETERS:
-    mesh_defects.element_nodal_fields[k][defect_mask] *= DEFECT_VELOCITY_FACTOR ** 2
-print(f"Defects: {len(DEFECT_CENTERS)} circles, radius {DEFECT_RADIUS * MM:.2f} mm, "
-      f"{defect_mask.sum()} GLL nodes in {defect_mask.any(axis=1).sum()} elements, "
-      f"velocity x {DEFECT_VELOCITY_FACTOR:.2f}")
+    d = np.linalg.norm(_nodes - c, axis=-1)
+    defect_mask |= d < d.min() + 1e-9                           # nearest node and its copies
+    defect_nodes.append(_nodes[np.unravel_index(np.argmin(d), d.shape)])
+    print(f"  point scatterer at ({c[0] * MM:.2f}, {c[1] * MM:.2f}) mm -> GLL node "
+          f"({defect_nodes[-1][0] * MM:.3f}, {defect_nodes[-1][1] * MM:.3f}) mm")
+defect_nodes = np.array(defect_nodes)
+for k in STIFFNESS_PARAMETERS + ['RHO']:
+    mesh_defects.element_nodal_fields[k][defect_mask] *= DEFECT_IMPEDANCE_FACTOR
+print(f"Defects: {len(DEFECT_CENTERS)} point scatterers ({defect_mask.sum()} element-node entries), "
+      f"stiffness and density x {DEFECT_IMPEDANCE_FACTOR:g} (impedance x {DEFECT_IMPEDANCE_FACTOR:g}, "
+      f"velocity unchanged)")
 
 z_rec, theta_rec = reconstructed_profile()
 migration_meshes = {}
@@ -241,7 +246,7 @@ for name in MIGRATION_MODELS:
 
 
 # =============================================================================
-# Time step from the CFL limit of the stiffest mesh (the defects raise the velocity x 3.1)
+# Time step from the CFL limit of the fastest mesh (impedance defects keep the background velocity)
 # =============================================================================
 
 def cfl_time_step(mesh):
@@ -341,8 +346,9 @@ def volume_field(sim_name, event_name):
 # =============================================================================
 
 def draw_defects(ax, color='k'):
-    for c in DEFECT_CENTERS:
-        ax.add_patch(plt.Circle(c * MM, DEFECT_RADIUS * MM, fill=False, ec=color, lw=0.7, ls='--', zorder=6))
+    """Point scatterers as open circles around their GLL nodes."""
+    ax.scatter(defect_nodes[:, 0] * MM, defect_nodes[:, 1] * MM, s=30, facecolors='none',
+               edgecolors=color, linewidths=0.7, zorder=6)
 
 
 fig, ax = plot_orientation_field(mesh_true, tx_location[None, :], r_loc_all, extent=(x0, x1, y0, y1))

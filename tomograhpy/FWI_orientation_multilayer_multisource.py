@@ -1,0 +1,1188 @@
+"""
+Elastic FWI for the grain orientation theta(y) of a multilayer anisotropic stack,
+multi-source acquisition.
+
+Same as FWI_orientation_multilayer.py (five oriented layers between two background
+slabs), but with a source array on the top surface matching the receiver array on
+the bottom surface: 9 sources at x = 1 ... 9 mm (y = 10 mm), each a separate event
+recorded by all 9 receivers at x = 1 ... 9 mm (y = 0). Misfit and gradient are summed
+over the events (81 source-receiver pairs instead of 9):
+
+  * gradient   : Salvus built-in adjoint gradient K_C (compute_gradients /
+                 sum_gradients), mapped to K_theta = K_C :: dC/dtheta
+  * model      : theta at the ROI nodes (the whole layered stack, interfaces
+                 NOT assumed known); layered prior theta(y) enforced by
+                 x-averaging, accepted profiles Gaussian-smoothed along y
+  * optimizer  : L-BFGS + trust region (L-inf ball in theta, radians)
+  * mask       : gradient zeroed outside the first-Fresnel-zone ellipses
+  * multiscale : frequency stages alpha * CENTRAL_FREQUENCY, warm-started;
+                 simulation end time end_time / alpha per stage
+
+Unlike the acoustic case the gradient is NOT mirror-symmetrised about x = 5 mm:
+a tilted anisotropic medium maps theta -> -theta under that reflection.
+
+Self-contained: paths, true model, mesh, events and the starting model
+(mesh_init) are all set up below. Run from the tomograhpy folder:
+    python FWI_orientation_multilayer_multisource.py
+
+Units: SI throughout (m, s, Pa, kg/m^3); plots use mm.
+"""
+
+import copy
+import os
+import shutil
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')   # file-only backend: figures are saved, never shown (no X server needed)
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.ndimage import gaussian_filter1d
+
+import salvus.mesh
+import salvus.mesh.layered_meshing as lm
+import salvus.namespace as sn
+from salvus.material._details import material as md
+
+from my_code.utilities import elemental_nodal_to_nodal_field
+from my_code.model_error import save_model_error_figures
+from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
+                                C_OBS, C_SYN, C_TRUE, GRID_KW, MM as mm)
+from material_ela_constants.Elastic_Material import Austenite
+
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+_ON_ISAMBARD = os.environ.get('SCRATCH', '').startswith('/scratch')
+
+if _ON_ISAMBARD:
+    # Isambard AI HPC — store all large files on scratch (Lustre)
+    _BASE           = os.environ['SCRATCH'] + '/Salvus_project/elastic_model/anisotropic'
+    PROJECT_DIR_WIN = _BASE + '/Project'
+    DATA_DIR_WIN    = _BASE + '/data'
+    IMAGE_DIR_WIN   = _BASE + '/image'
+else:
+    # WSL / Windows
+    PROJECT_DIR_WIN = '/mnt/f/Salvus_project/elastic_model/anisotropic/Project'
+    DATA_DIR_WIN    = '/mnt/f/Salvus_project/elastic_model/anisotropic/data'
+    IMAGE_DIR_WIN   = '/mnt/f/Salvus_project/elastic_model/anisotropic/image'
+
+# Separate from the notebook's "tomography_solid_orientation_multilayer" project, whose
+# src_1 event was registered with a different receiver set
+PROJECT_NAME = "tomography_solid_orientation_multilayer_multisource_fwi"   # folder inside PROJECT_DIR_WIN
+
+FWI_IMAGE_DIR = Path(IMAGE_DIR_WIN) / "FWI_orientation_multilayer_multisource"
+FWI_DATA_DIR  = Path(DATA_DIR_WIN) / "FWI_orientation_multilayer_multisource"
+PAPER_FIG_DIR = FWI_IMAGE_DIR / "paper_figures"
+
+# Start every run from scratch: delete this script's previous data, images and Salvus project
+for _d in (FWI_IMAGE_DIR, FWI_DATA_DIR, Path(PROJECT_DIR_WIN, PROJECT_NAME)):
+    if _d.exists():
+        print(f"Deleting previous results: {_d}")
+        shutil.rmtree(_d)
+
+
+# =============================================================================
+# Solver / compute site
+# =============================================================================
+
+SITE_NAME = "isambard_oliver" if _ON_ISAMBARD else "oliver_wsl"   # Salvus site to run simulations on
+RANKS     = 2              # MPI ranks per simulation job (the 2D mesh is only ~7k elements)
+
+
+# =============================================================================
+# Source wavelet and time axis
+# =============================================================================
+
+# Stage centre frequency = alpha * CENTRAL_FREQUENCY; the mesh is built for alpha = 1
+CENTRAL_FREQUENCY      = 2e6                         # Ricker centre frequency at alpha = 1 [Hz]
+# dt = 1 / (250 f_c) = 2 ns must stay below the mesh CFL limit (~2.19 ns for the
+# 4-elements-per-wavelength, 4 MHz mesh); checked against the mesh after it is built
+sampling_rate_in_hertz = CENTRAL_FREQUENCY * 250
+time_step_in_seconds   = 1 / sampling_rate_in_hertz  # solver/output time step [s]
+end_time               = 6e-6                        # simulation end time at alpha = 1 [s]
+
+amplitude_ratio = 1e10              # source amplitude (fy of VectorPoint2D)
+
+
+# =============================================================================
+# Domain geometry
+# =============================================================================
+
+x0, x1 = 0.0, 0.01                 # horizontal extent [m] (10 mm)
+y0, y1 = 0.0, 0.01                 # vertical extent [m]   (10 mm)
+
+# Interfaces top to bottom [m]: background / layers 1-5 / background
+LAYER_INTERFACES_Y = [0.009, 0.007, 0.006, 0.0045, 0.002, 0.001]
+LAYER_TOP_Y        = LAYER_INTERFACES_Y[0]    # top of the oriented stack [m]
+LAYER_BOTTOM_Y     = LAYER_INTERFACES_Y[-1]   # bottom of the oriented stack [m]
+
+
+# =============================================================================
+# Material and orientations
+# =============================================================================
+
+matl    = Austenite()                         # hexagonal austenite (RHO, Cij)
+VP_0deg = np.sqrt(matl.C33 / matl.RHO)        # P velocity along symmetry axis [m/s]
+
+# Grain orientation angles passed to ClockwiseAngle (symmetry axis measured
+# clockwise from +z).
+BACKGROUND_ANGLE_DEG = 45.0
+LAYER_ANGLES_DEG     = [70.0, 30.0, 60.0, 20.0, 40.0]   # layers 1-5, top to bottom
+
+STIFFNESS_PARAMETERS = {'C11', 'C12', 'C13', 'C22', 'C23', 'C33'}   # Salvus 2D Voigt names
+
+
+# =============================================================================
+# Mesh resolution and absorbing boundaries
+# =============================================================================
+
+elements_per_wavelength = 4                       # elements per minimum wavelength
+model_order             = 4                       # spectral-element polynomial order
+ab_reference_velocity   = VP_0deg                 # absorbing layer thickness measured in P wavelengths [m/s]
+reference_frequency     = CENTRAL_FREQUENCY * 2   # max frequency resolved by the mesh [Hz]
+number_of_wavelengths   = 2                       # absorbing layer thickness (in wavelengths)
+free_surfaces           = ['y0', 'y1']            # sides without absorbing layer
+
+
+# =============================================================================
+# Model / kernel helpers
+# =============================================================================
+
+def oriented_material(material_unoriented, angle_in_degrees):
+    """Rotate a hexagonal material and convert it to the 2D solver form (C11..C33)."""
+    orientation = sn.material.orientation.ClockwiseAngle.from_params(
+        angle_in_degrees=angle_in_degrees
+    )
+    return md.to_solver_form(material_unoriented.with_orientation(orientation), ndim=2)
+
+
+def theta_from_mesh(mesh):
+    """
+    Element-nodal grain orientation theta [rad] of a mesh (ClockwiseAngle convention).
+
+    Under a rotation by theta, C22 - C11 = D cos(2 theta) and
+    2 (C13 + C23) = D sin(2 theta), so theta follows from atan2 without the
+    unoriented reference tensor (works for inverted models too).
+    """
+    f = mesh.element_nodal_fields
+    return 0.5 * np.arctan2(2.0 * (f['C13'] + f['C23']), f['C22'] - f['C11'])
+
+
+def dC_dtheta(theta, matl):
+    """
+    Derivative of the rotated 2D stiffness tensor w.r.t. theta [Pa/rad].
+
+    Uses the unrotated (theta = 0) hexagonal constants Cbar of `matl` in the
+    x-z plane (Cbar11 = C11, Cbar13 = C13, Cbar33 = C33, Cbar55 = C44):
+        alpha = Cbar11 - 2 Cbar13 + Cbar33 - 4 Cbar55
+        gamma = Cbar11 - Cbar33
+    Returned keys are Salvus 2D Voigt names (1 = xx, 2 = zz, 3 = xz), i.e.
+    paper C11, C13, C15, C33, C35, C55 -> Salvus C11, C12, C13, C22, C23, C33.
+    """
+    alpha = matl.C11 - 2.0 * matl.C13 + matl.C33 - 4.0 * matl.C44
+    gamma = matl.C11 - matl.C33
+    s2, c2 = np.sin(2.0 * theta), np.cos(2.0 * theta)
+    s4, c4 = np.sin(4.0 * theta), np.cos(4.0 * theta)
+    return {
+        'C11': -0.5 * (alpha * s4 + 2.0 * gamma * s2),   # dC11/dtheta
+        'C12':  0.5 * alpha * s4,                        # dC13/dtheta
+        'C13': -0.5 * (gamma * c2 + alpha * c4),         # dC15/dtheta
+        'C22': -0.5 * (alpha * s4 - 2.0 * gamma * s2),   # dC33/dtheta
+        'C23': -0.5 * (gamma * c2 - alpha * c4),         # dC35/dtheta
+        'C33':  0.5 * alpha * s4,                        # dC55/dtheta
+    }
+
+
+def orientation_kernel(gradient_mesh, model_mesh, matl):
+    """
+    Sensitivity kernel w.r.t. grain orientation, K_theta = K_C :: dC/dtheta.
+
+    gradient_mesh : Salvus gradient (element-nodal fields C11 ... C33). These
+                    are already pointwise kernels K_C (the mass matrix is
+                    stored separately as 'FemMassMatrix'), so the chain rule
+                    is applied node by node.
+    model_mesh    : model the gradient was computed in (gives theta(x))
+
+    Returns the element-nodal K_theta array [per rad], same shape as the fields.
+    """
+    dC = dC_dtheta(theta_from_mesh(model_mesh), matl)
+    return sum(gradient_mesh.element_nodal_fields[k] * dC[k] for k in dC)
+
+
+# =============================================================================
+# Salvus helpers
+# =============================================================================
+
+def forward_simulation(simulation_name, events):
+    """Launch a forward simulation (receiver data only) in project `p` and block until it finishes."""
+    _n_events = 1 if isinstance(events, str) else len(events)
+    print(f"  [forward_simulation] launching '{simulation_name}' for {_n_events} event(s) ...")
+
+    t_start = time.perf_counter()
+    p.simulations.launch(
+        ranks_per_job=RANKS,
+        site_name=SITE_NAME,
+        events=events,
+        simulation_configuration=simulation_name,
+        delete_conflicting_previous_results=True,
+    )
+
+    # Wait for THIS simulation only (an untargeted query also polls stale jobs,
+    # e.g. from interrupted runs, and can fail on them). query(block=True)
+    # occasionally raises while it polls a running job; keep waiting instead.
+    while True:
+        try:
+            p.simulations.query(simulation_configuration=simulation_name, events=events,
+                                block=True, verbosity=-1)
+            break
+        except (AssertionError, ValueError) as e:
+            print(f"  [forward_simulation] query retry after {type(e).__name__}: {e}")
+            time.sleep(2)
+    elapsed = time.perf_counter() - t_start
+    print(f"  [forward_simulation] '{simulation_name}' finished in "
+          f"{elapsed:.1f} s ({elapsed / 60:.2f} min) wall-clock.")
+
+
+def extract_data(simulation, events, receiver_field='displacement'):
+    """Receiver waveforms (xarray) of a finished simulation for the first event in `events`."""
+    ed = p.waveforms.get(data_name=simulation, events=events)[0]
+    return ed.get_waveform_data_xarray(receiver_field=receiver_field)
+
+
+# =============================================================================
+# Project, true model and mesh
+# =============================================================================
+
+domain = sn.domain.dim2.BoxDomain(x0=x0, x1=x1, y0=y0, y1=y1)
+
+p = sn.Project.from_domain(
+    path=Path(PROJECT_DIR_WIN, PROJECT_NAME), domain=domain, load_if_exists=True
+)
+
+# Unrotated hexagonal material built from the austenite constants
+material_unoriented = sn.material.elastic.hexagonal.TensorComponents.from_params(
+    **matl.VTI_parameters()
+)
+
+matl_background = oriented_material(material_unoriented, BACKGROUND_ANGLE_DEG)
+matl_layers     = [oriented_material(material_unoriented, a) for a in LAYER_ANGLES_DEG]
+
+# Layers listed top to bottom: background / layers 1-5 / background
+_layer_stack = [matl_background]
+for _y_if, _matl in zip(LAYER_INTERFACES_Y, matl_layers + [matl_background]):
+    _layer_stack += [sn.layered_meshing.interface.Hyperplane.at(_y_if), _matl]
+m_true = lm.LayeredModel(_layer_stack)
+
+ab_params = salvus.mesh.simple_mesh.basic_mesh.AbsorbingBoundaryParameters(
+    free_surface=free_surfaces,
+    number_of_wavelengths=number_of_wavelengths,
+    reference_velocity=ab_reference_velocity,
+    reference_frequency=reference_frequency,
+)
+
+mesh_res = sn.MeshResolution(
+    reference_frequency=reference_frequency,
+    elements_per_wavelength=elements_per_wavelength,
+    model_order=model_order,
+)
+
+# True (layered) model
+mesh = lm.mesh_from_domain(
+    domain=domain,
+    model=sn.layered_meshing.MeshingProtocol(m_true, ab=ab_params),
+    mesh_resolution=mesh_res,
+)
+
+# Starting model: same mesh, homogeneous background orientation everywhere
+mesh_init = mesh.copy()
+for k in STIFFNESS_PARAMETERS:
+    mesh_init.element_nodal_fields[k][:] = getattr(matl_background, k).p
+
+# CFL check: the fastest quasi-P speed is bounded by the largest eigenvalue of the
+# 2D Voigt tensor, which a rotation leaves (nearly) unchanged -> valid for all theta
+_f = mesh.element_nodal_fields
+_C_voigt = np.stack([np.stack([_f['C11'], _f['C12'], _f['C13']], -1),
+                     np.stack([_f['C12'], _f['C22'], _f['C23']], -1),
+                     np.stack([_f['C13'], _f['C23'], _f['C33']], -1)], -2)
+_v_max = np.sqrt(np.linalg.eigvalsh(_C_voigt)[..., -1] / _f['RHO']).max(axis=1)
+_dt_cfl = mesh.compute_time_step(max_velocity=_v_max)[0]
+print(f"CFL time step {_dt_cfl * 1e9:.3f} ns, using {time_step_in_seconds * 1e9:.3f} ns")
+assert time_step_in_seconds < _dt_cfl, "time step above the CFL limit: raise sampling_rate_in_hertz"
+
+
+# =============================================================================
+# Sources, receivers and events
+# =============================================================================
+
+# Source array on the top surface, as many sources as receivers on the bottom surface (transmission)
+r_loc_all    = np.array([[x, 0.0] for x in np.linspace(0.001, 0.009, 9)])  # receiver (x, y) [m], shared by all events
+tx_locations = np.column_stack([r_loc_all[:, 0], np.full(len(r_loc_all), y1)])   # source (x, y) [m], one row per source
+
+receivers = [
+    sn.simple_config.receiver.cartesian.Point2D(
+        x=r[0], y=r[1], station_code=f"R{j+1}", fields=["displacement"]
+    )
+    for j, r in enumerate(r_loc_all)
+]
+
+# One event per source, each recorded by all receivers
+event_ls = []
+for i, s in enumerate(tx_locations):
+    event_name = f"src_{i+1}"
+    source = sn.simple_config.source.cartesian.VectorPoint2D(
+        x=s[0], y=s[1], fx=0, fy=amplitude_ratio
+    )
+    p.add_to_project(
+        sn.Event(event_name=event_name, sources=source, receivers=receivers)
+    )
+    event_ls.append(event_name)
+print(f"{len(event_ls)} event(s) registered: {event_ls}")
+
+
+# =============================================================================
+# Figure style (project journal format, my_code/plot_style.py) and the
+# simulation configuration: true orientation field with source and receivers
+# =============================================================================
+
+apply_paper_style()
+
+for _d in (FWI_IMAGE_DIR, FWI_DATA_DIR, PAPER_FIG_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+fig, _ = plot_orientation_field(mesh, tx_locations, r_loc_all, extent=(x0, x1, y0, y1),
+                                save_path=PAPER_FIG_DIR / "FWI_orientation_configuration")
+plt.close(fig)
+
+# =============================================================================
+# FWI settings
+# =============================================================================
+
+# Multiscale continuation: centre frequency = alpha * CENTRAL_FREQUENCY, low -> high.
+# alpha <= 1 keeps every stage within the mesh resolution (reference_frequency = 2 f_c).
+alpha_ls           = [0.2, 0.4, 0.6, 0.8, 1.0]  # f_c = alpha * CENTRAL_FREQUENCY (0.4 ... 2 MHz)
+# Simulation end time per stage: end_time is the alpha = 1 value, scaled with the period
+end_time_ls        = [end_time / alpha for alpha in alpha_ls]   # 30, 15, 10, 7.5, 6 us
+MAX_ITER_PER_STAGE = 10                        # max accepted L-BFGS iterations per stage
+
+# Inverted region = the whole oriented stack (layers 1-5) as one theta(y) profile:
+# the inner interfaces are not imposed, so the inversion has to locate them. The
+# background slabs above and below stay at their known orientation.
+# x spans the whole mesh (incl. absorbing layers): the layers continue there, and the
+# x-averaged theta(y) prior would otherwise be diluted by fixed background nodes.
+ROI = (mesh_init.points[:, 0].min(), mesh_init.points[:, 0].max(),
+       LAYER_BOTTOM_Y, LAYER_TOP_Y)             # (x0, x1, y0, y1) [m]
+THETA_MIN, THETA_MAX = np.deg2rad(0.0), np.deg2rad(90.0)   # orientation bounds [rad]
+# Smoothing of the accepted MODEL (sigma in y-levels). Off: re-smoothing the model after
+# every step compounds (~sigma sqrt(n_iter)) and erodes the interfaces; the UPDATE is
+# smoothed instead (below). Kept for comparison; > 0 costs one extra forward + adjoint per step.
+MODEL_SMOOTH_SIGMA   = 0.0                      # Gaussian smoothing of theta(y) [y-levels]
+
+# Gaussian smoothing of the UPDATE in y, built into the L-BFGS initial inverse Hessian.
+# sigma = UPDATE_SMOOTH_WAVELENGTHS * shear wavelength of the stage, i.e. scaled with the
+# resolution: 0.80 / 0.40 / 0.27 / 0.20 / 0.16 mm at 0.4 / 0.8 / 1.2 / 1.6 / 2.0 MHz. In metres,
+# so it does not depend on the (non-uniform, 43-109 um) GLL y-level spacing.
+VS_0deg                   = np.sqrt(matl.C44 / matl.RHO)   # S velocity along symmetry axis [m/s]
+UPDATE_SMOOTH_WAVELENGTHS = 0.1                 # sigma / lambda_S
+
+# Illumination preconditioner: K_theta is far stronger near the source than at depth,
+# so the L-BFGS direction is divided by a depth profile E(y) of |K_theta| (mass-weighted
+# level mean, Gaussian-smoothed in y), fixed per stage from the stage's first gradient.
+# The water level keeps poorly illuminated levels from being over-amplified.
+PRECOND_ILLUMINATION = True
+PRECOND_WATER_LEVEL  = 0.05                     # floor of E(y), fraction of max E
+PRECOND_SMOOTH_Y     = 0.5e-3                   # Gaussian smoothing length of E(y) [m]
+
+# Trust region in theta [rad] (L-inf ball)
+DELTA_TR_INIT = np.deg2rad(5.0)
+DELTA_TR_MAX  = np.deg2rad(20.0)
+
+DIAG_EVENT    = event_ls[len(event_ls) // 2]          # source shown in the diagnostic figures
+DIAG_STATION  = f"R{len(r_loc_all) // 2 + 1}"         # receiver shown in the single-trace figures
+DIAG_RECEIVER = f"XX.{DIAG_STATION}."                 # its receiver_id in the waveform xarray
+print(f"DIAG_EVENT = {DIAG_EVENT!r}, DIAG_RECEIVER = {DIAG_RECEIVER!r}")
+
+
+# =============================================================================
+# Orientation -> stiffness
+# =============================================================================
+
+def stiffness_from_theta(theta, matl):
+    """
+    Rotated 2D stiffness for orientation theta [rad] (ClockwiseAngle convention).
+
+    Closed forms whose theta-derivatives are exactly dC_dtheta():
+        C11 = beta/8 + gamma/2 cos2t + alpha/8 cos4t
+        C13 = (Cb11 + 6 Cb13 + Cb33 - 4 Cb55)/8 - alpha/8 cos4t
+        C15 = -gamma/4 sin2t - alpha/8 sin4t
+        C33 = beta/8 - gamma/2 cos2t + alpha/8 cos4t
+        C35 = -gamma/4 sin2t + alpha/8 sin4t
+        C55 = (Cb11 - 2 Cb13 + Cb33 + 4 Cb55)/8 - alpha/8 cos4t
+    Keys are Salvus 2D Voigt names (C11, C12, C13, C22, C23, C33).
+    """
+    Cb11, Cb13, Cb33, Cb55 = matl.C11, matl.C13, matl.C33, matl.C44
+    a = Cb11 - 2.0 * Cb13 + Cb33 - 4.0 * Cb55
+    b = 3.0 * Cb11 + 2.0 * Cb13 + 3.0 * Cb33 + 4.0 * Cb55
+    g = Cb11 - Cb33
+    s2, c2 = np.sin(2.0 * theta), np.cos(2.0 * theta)
+    s4, c4 = np.sin(4.0 * theta), np.cos(4.0 * theta)
+    return {
+        'C11': b / 8.0 + g / 2.0 * c2 + a / 8.0 * c4,
+        'C12': (Cb11 + 6.0 * Cb13 + Cb33 - 4.0 * Cb55) / 8.0 - a / 8.0 * c4,
+        'C13': -g / 4.0 * s2 - a / 8.0 * s4,
+        'C22': b / 8.0 - g / 2.0 * c2 + a / 8.0 * c4,
+        'C23': -g / 4.0 * s2 + a / 8.0 * s4,
+        'C33': (Cb11 - 2.0 * Cb13 + Cb33 + 4.0 * Cb55) / 8.0 - a / 8.0 * c4,
+    }
+
+
+# consistency check against Salvus' own rotation (the true-model layer materials)
+for _angle, _matl_layer in zip(LAYER_ANGLES_DEG, matl_layers):
+    _C_check = stiffness_from_theta(np.deg2rad(_angle), matl)
+    for _k in STIFFNESS_PARAMETERS:
+        assert np.isclose(_C_check[_k], getattr(_matl_layer, _k).p, rtol=1e-9, atol=1e-3), _k
+
+
+# =============================================================================
+# Geometry-only setup (frequency independent)
+# =============================================================================
+
+# Starting model = homogeneous background orientation (mesh_init); same mesh as the true model
+base_mesh = copy.deepcopy(mesh_init)
+
+_x, _y = base_mesh.points[:, 0], base_mesh.points[:, 1]
+x0_roi, x1_roi, y0_roi, y1_roi = ROI
+_tol = 1e-9   # [m] keeps the interface nodes inside the ROI
+roi_mask = ((_x >= x0_roi - _tol) & (_x <= x1_roi + _tol) &
+            (_y >= y0_roi - _tol) & (_y <= y1_roi + _tol))
+_x_roi, _y_roi = _x[roi_mask], _y[roi_mask]
+
+# Elements inside the layer: only these take the inverted theta. The mesh
+# conforms to the interfaces, so theta stays discontinuous there — background
+# elements sharing an interface node keep the background orientation.
+_cen_y = base_mesh.get_element_centroid()[:, 1]
+_roi_elems = (_cen_y > y0_roi) & (_cen_y < y1_roi)
+_conn_roi  = base_mesh.connectivity[_roi_elems]
+# Share of each node's mass that belongs to layer elements (1 inside, ~1/2 on the
+# interfaces, 0 outside): only the layer elements take the inverted theta
+_n_elem_per_node  = np.bincount(base_mesh.connectivity.ravel(), minlength=base_mesh.npoint)
+_n_layer_per_node = np.bincount(_conn_roi.ravel(), minlength=base_mesh.npoint)
+_layer_frac = _n_layer_per_node / np.maximum(_n_elem_per_node, 1)
+_theta_bg_elemental = theta_from_mesh(base_mesh)   # element-nodal background theta
+np.save(FWI_DATA_DIR / "roi_node_xy.npy", np.column_stack([_x_roi, _y_roi]))
+
+# Nodal theta of the starting model (background value everywhere)
+_theta_bg_nodal = elemental_nodal_to_nodal_field(theta_from_mesh(base_mesh), base_mesh.connectivity)
+THETA_HOMO = float(_theta_bg_nodal.mean())
+print(f"THETA_HOMO (from mesh_init) = {np.rad2deg(THETA_HOMO):.2f} deg")
+
+# True theta(y), for plotting only
+_theta_true_nodal = elemental_nodal_to_nodal_field(theta_from_mesh(mesh), mesh.connectivity)
+
+# y-levels for the layered prior (coordinates are O(1e-3) m)
+_y_round_full = np.round(_y, decimals=10)
+_y_round_roi  = np.round(_y_roi, decimals=10)
+_y_levels     = np.unique(_y_round_full)
+
+# Full list of acquired (source, receiver) pairs
+sr_pairs = [(tuple(s), tuple(r)) for s in tx_locations for r in r_loc_all]
+
+_fwi_iter   = [0]
+_fwi_ls     = [0]
+_fwi_call   = [0]   # unique simulation names: Salvus caches results per configuration name
+_diag_cache = {}    # filled by objective() for DIAG_EVENT, read by the optimizer for plotting
+_W_roi      = [None]   # per-node level mass (L-BFGS preconditioner), set by objective()
+_P_roi      = [None]   # per-node illumination preconditioner 1/E(y), set once per stage by objective()
+
+
+def _average_theta_in_x(theta_nodal):
+    """Layered prior theta(y): every node gets the mean theta of its y-level."""
+    out = theta_nodal.copy()
+    for yv in _y_levels:
+        mask = _y_round_full == yv
+        out[mask] = theta_nodal[mask].mean()
+    return out
+
+
+def _theta_profile(theta_nodal):
+    """theta(y) profile (one value per y-level) of a nodal field."""
+    return np.array([theta_nodal[_y_round_full == yv].mean() for yv in _y_levels])
+
+
+def build_mesh_from_model(m_flat):
+    """
+    Decode theta (ROI) -> layered theta(y) -> stiffness, attached to a copy of the mesh.
+
+    Returns
+    -------
+    mesh_it     : mesh with the rotated C11 ... C33 fields
+    theta_nodal : (n_nodes,)      full (x-averaged) theta field [rad]
+    theta_roi   : (n_roi_nodes,)  theta restricted to the ROI [rad]
+    """
+    theta_nodal = _theta_bg_nodal.copy()
+    theta_nodal[roi_mask] = np.clip(m_flat, THETA_MIN, THETA_MAX)
+    theta_nodal = _average_theta_in_x(theta_nodal)
+
+    # only the layer elements change; the background elements keep their theta
+    theta_en = _theta_bg_elemental.copy()
+    theta_en[_roi_elems] = theta_nodal[_conn_roi]
+
+    mesh_it = copy.deepcopy(base_mesh)
+    C = stiffness_from_theta(theta_en, matl)
+    for k in STIFFNESS_PARAMETERS:
+        mesh_it.attach_field(k, C[k])
+    return mesh_it, theta_nodal, theta_nodal[roi_mask]
+
+
+def _ellipse_mask(xs, ys, pairs, margin):
+    """Union of first-Fresnel-zone ellipses a = (|s - r| + margin) / 2 over all pairs."""
+    mask = np.zeros_like(xs, dtype=bool)
+    for s, r in pairs:
+        d_sr = np.hypot(s[0] - r[0], s[1] - r[1])
+        a = (d_sr + margin) / 2
+        mask |= (np.hypot(xs - s[0], ys - s[1]) + np.hypot(xs - r[0], ys - r[1])) <= 2 * a
+    return mask
+
+
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
+def _kernel_axes(ax, K, xs, ys, title, xlim, ylim, label):
+    """tripcolor of a nodal kernel with a symmetric (99th-percentile) colour scale."""
+    vmax = np.percentile(np.abs(K), 99.0) or 1.0
+    tp = ax.tripcolor(xs * mm, ys * mm, K, cmap='RdBu', shading='gouraud',
+                      vmin=-vmax, vmax=vmax, rasterized=True)
+    ax.set_xlabel('$x$ (mm)'); ax.set_ylabel('$z$ (mm)')
+    ax.set_title(title)
+    ax.set_xlim(*[v * mm for v in xlim]); ax.set_ylim(*[v * mm for v in ylim])
+    ax.set_aspect('equal')
+    cax = make_axes_locatable(ax).append_axes('right', size='5%', pad=0.08)
+    plt.colorbar(tp, cax=cax, label=label)
+
+
+def plot_fwi_diagnostics(it, u_obs, u_syn, f_adj, K_theta, K_roi, save=True):
+    """
+    Waveforms + adjoint source (DIAG_RECEIVER), receiver gather, full K_theta and
+    masked ROI K_theta for iteration `it`.
+    """
+    t_us = u_obs.time.values * 1e6
+
+    # ── Figure 1: observed vs synthetic and adjoint source, X and Y ────────
+    fig1, axs = plt.subplots(2, 2, figsize=(7.0, 4.0), layout='constrained', sharex=True)
+    for col, comp in enumerate(['X', 'Y']):
+        axs[0, col].plot(t_us, u_syn.sel(receiver_id=DIAG_RECEIVER, component=comp).values.squeeze(),
+                         color=C_SYN, lw=0.9, label=rf'$u^{{({it})}}_{comp.lower()}$')
+        axs[0, col].plot(t_us, u_obs.sel(receiver_id=DIAG_RECEIVER, component=comp).values.squeeze(),
+                         color=C_OBS, lw=0.9, ls='--', label=rf'$u_{{{comp.lower()},\mathrm{{obs}}}}$')
+        axs[0, col].legend(frameon=False)
+        axs[0, col].set_ylabel(f'$u_{comp.lower()}$ (m)')
+        axs[0, col].set_title(f'({"ab"[col]}) Observed vs. synthetic, {comp}, {DIAG_STATION} '
+                              f'(iteration {it})')
+        axs[1, col].plot(t_us, f_adj[col], color='0.3', lw=0.9)
+        axs[1, col].axhline(0, color='k', lw=0.4, ls='--')
+        axs[1, col].set_xlabel(r'Time ($\mu$s)')
+        axs[1, col].set_ylabel(rf'$f^\dagger_{comp.lower()}$')
+        axs[1, col].set_title(rf'({"cd"[col]}) Adjoint source $f^\dagger = d - u$, {comp}')
+        for ax in axs[:, col]:
+            ax.grid(True, **GRID_KW)
+    if save:
+        plt.savefig(FWI_IMAGE_DIR / f'iter_{it:03d}_waveforms_adjoint_source_alpha_{alpha}.png')
+    plt.close(fig1)
+
+    # ── Figure 1b: receiver gather, observed vs synthetic, X and Y ──────────
+    # Traces offset by receiver x and scaled by the largest observed amplitude per component
+    rec_ids = [f"XX.R{j + 1}." for j in range(len(r_loc_all))]
+    dx_mm   = np.diff(r_loc_all[:, 0]).min() * mm if len(r_loc_all) > 1 else 1.0
+    fig1b, axs = plt.subplots(1, 2, figsize=(7.0, 4.0), layout='constrained', sharey=True)
+    for col, comp in enumerate(['X', 'Y']):
+        scale = 0.45 * dx_mm / (np.abs(u_obs.sel(component=comp).values).max() or 1.0)
+        for j, rid in enumerate(rec_ids):
+            x_mm = r_loc_all[j, 0] * mm
+            axs[col].plot(x_mm + scale * u_obs.sel(receiver_id=rid, component=comp).values.squeeze(),
+                          t_us, color=C_OBS, lw=0.7, ls='--', label='Observed' if j == 0 else None)
+            axs[col].plot(x_mm + scale * u_syn.sel(receiver_id=rid, component=comp).values.squeeze(),
+                          t_us, color=C_SYN, lw=0.7, label=f'Iteration {it}' if j == 0 else None)
+        axs[col].set_xlabel('Receiver $x$ (mm)')
+        axs[col].set_title(f'({"ab"[col]}) Receiver gather, {comp}')
+        axs[col].grid(True, **GRID_KW)
+    axs[0].set_ylabel(r'Time ($\mu$s)')
+    axs[0].invert_yaxis()
+    axs[0].legend(frameon=False, loc='lower left')
+    if save:
+        plt.savefig(FWI_IMAGE_DIR / f'iter_{it:03d}_receiver_gather_alpha_{alpha}.png')
+    plt.close(fig1b)
+
+    # ── Figure 2: full K_theta ──────────────────────────────────────────────
+    fig2, ax = plt.subplots(figsize=(3.5, 2.9))
+    _kernel_axes(ax, K_theta, _x, _y, rf'$K_\theta$ (iteration {it})',
+                 (x0, x1), (y0, y1), r'$K_\theta$')
+    for (s, r) in sr_pairs:
+        ax.scatter(s[0] * mm, s[1] * mm, marker='v', color='red', s=20, zorder=5)
+        ax.scatter(r[0] * mm, r[1] * mm, marker='^', color='lime', s=12, zorder=5)
+    fig2.subplots_adjust(left=0.13, right=0.80, bottom=0.14, top=0.92)
+    if save:
+        plt.savefig(FWI_IMAGE_DIR / f'iter_{it:03d}_kernel_theta_full_alpha_{alpha}.png')
+    plt.close(fig2)
+
+    # ── Figure 3: K_theta in the ROI, masked to the Fresnel zone ───────────
+    fig3, ax = plt.subplots(figsize=(3.5, 2.9))
+    _kernel_axes(ax, np.where(_ellipse_roi, K_roi, 0.0), _x_roi, _y_roi,
+                 rf'$K_\theta$ in ROI (iteration {it})',
+                 (x0, x1), (y0_roi, y1_roi), r'$K_\theta$')
+    fig3.subplots_adjust(left=0.13, right=0.80, bottom=0.14, top=0.92)
+    if save:
+        plt.savefig(FWI_IMAGE_DIR / f'iter_{it:03d}_kernel_theta_roi_alpha_{alpha}.png')
+    plt.close(fig3)
+
+
+def plot_theta_model(theta_nodal, it, ls):
+    """theta field and theta(y) profile (vs. the true profile) of one objective() call."""
+    fig, axes = plt.subplots(1, 2, figsize=(7.0, 3.0), layout='constrained')
+    tp = axes[0].tripcolor(_x * mm, _y * mm, np.rad2deg(theta_nodal), cmap='viridis',
+                           vmin=0.0, vmax=90.0, shading='gouraud', rasterized=True)
+    fig.colorbar(tp, ax=axes[0], label=r'$\theta$ (deg)', shrink=0.9)
+    axes[0].set_xlabel('$x$ (mm)'); axes[0].set_ylabel('$z$ (mm)')
+    axes[0].set_title(rf'(a) $\theta$ field (iteration {it}, ls {ls})')
+    axes[0].set_xlim(x0 * mm, x1 * mm); axes[0].set_ylim(y0 * mm, y1 * mm)
+    axes[0].set_aspect('equal')
+    axes[1].plot(np.rad2deg(_theta_profile(_theta_true_nodal)), _y_levels * mm,
+                 color=C_TRUE, lw=1.0, ls='--', label='True')
+    axes[1].plot(np.rad2deg(_theta_profile(theta_nodal)), _y_levels * mm,
+                 color=C_SYN, marker='o', markersize=2, lw=1.0, label='Current')
+    axes[1].axhspan(y0_roi * mm, y1_roi * mm, color='0.93', zorder=0, lw=0)
+    axes[1].set_xlabel(r'$\theta$ (deg)'); axes[1].set_ylabel('$z$ (mm)')
+    axes[1].set_title(rf'(b) $\theta(z)$ profile (iteration {it}, ls {ls})')
+    axes[1].set_ylim(y0 * mm, y1 * mm)
+    axes[1].legend(frameon=False)
+    axes[1].grid(True, **GRID_KW)
+    plt.savefig(FWI_IMAGE_DIR / f'iter_{it:03d}_ls_{ls}_theta_field_alpha_{alpha}.png')
+    plt.close(fig)
+
+
+# =============================================================================
+# Objective: misfit and K_theta from Salvus' built-in adjoint gradient
+# =============================================================================
+
+def _wait_for_result(call, name, poll_seconds=5, max_errors=60):
+    """
+    Repeat a non-blocking Salvus action until it returns a result.
+
+    compute_gradients / compute_misfits launch the next missing step (forward,
+    then adjoint) and return None until the result exists. Transient job-store
+    errors while polling (AssertionError / ValueError) are retried up to
+    `max_errors` times in a row before being raised.
+    """
+    n_errors = 0
+    while True:
+        try:
+            result = call()
+            n_errors = 0
+        except (AssertionError, ValueError) as e:
+            n_errors += 1
+            if n_errors > max_errors:
+                raise
+            print(f"  [{name}] retry {n_errors}/{max_errors} after {type(e).__name__}: {e}")
+            result = None
+        if result is not None:
+            return result
+        time.sleep(poll_seconds)
+
+def objective(m_flat):
+    """
+    Multi-source FWI objective — model parameter is theta [rad] at the ROI nodes.
+
+    Salvus runs forward + adjoint for all events and returns K_C summed over
+    events; K_theta = K_C :: dC/dtheta is evaluated at the current theta(x).
+
+    Returns
+    -------
+    misfit : float                           total L2 misfit, summed over sources
+    grad   : np.ndarray, (n_roi_nodes,)      K_theta at the ROI nodes, zeroed outside the Fresnel zone
+    """
+    it, ls = _fwi_iter[0], _fwi_ls[0]
+    _fwi_ls[0] += 1
+    _fwi_call[0] += 1
+    sim_name = f'fwi_theta_a{stage_idx}_{it:03d}_ls{ls}_c{_fwi_call[0]:03d}'
+    print(f"\n=== objective() call: alpha={alpha} iter={it} ls={ls} sim_name={sim_name!r} ===")
+
+    # ── 1. Decode theta, enforce theta(y), build the mesh ──────────────────
+    mesh_it, theta_nodal, theta_roi = build_mesh_from_model(m_flat)
+    print(f'  [obj] theta(y) in ROI: mean={np.rad2deg(theta_roi.mean()):.2f} deg  '
+          f'range=[{np.rad2deg(theta_roi.min()):.2f}, {np.rad2deg(theta_roi.max()):.2f}] deg')
+    plot_theta_model(theta_nodal, it, ls)
+
+    p.add_to_project(
+        sn.UnstructuredMeshSimulationConfiguration(
+            unstructured_mesh=mesh_it,
+            name=sim_name,
+            event_configuration=event_config_fwd,
+        ),
+        overwrite=True,
+    )
+
+    # ── 2. Forward + adjoint (Salvus built-in), all sources ────────────────
+    t_start = time.perf_counter()
+    _wait_for_result(lambda: p.actions.inversion.compute_gradients(
+        simulation_configuration=sim_name,
+        misfit_configuration=misfit_name,
+        events=event_ls,
+        site_name=SITE_NAME,
+        ranks_per_job=RANKS,
+        gradient_parameters=STIFFNESS_PARAMETERS,
+    ), "compute_gradients")
+    misfits = _wait_for_result(lambda: p.actions.inversion.compute_misfits(
+        simulation_configuration=sim_name,
+        misfit_configuration=misfit_name,
+        events=event_ls,
+        site_name=SITE_NAME,
+        ranks_per_job=RANKS,
+    ), "compute_misfits")
+    print(f'  [obj] forward + adjoint done in {time.perf_counter() - t_start:.1f} s')
+    misfit_total = float(sum(misfits.values()))
+
+    gradient_C = p.actions.inversion.sum_gradients(
+        simulation_configuration=sim_name,
+        misfit_configuration=misfit_name,
+        events=event_ls,
+        gradient_parameters=STIFFNESS_PARAMETERS,
+    )
+
+    # ── 3. K_theta = K_C :: dC/dtheta at the current theta(x) ──────────────
+    K_theta_en = orientation_kernel(gradient_C, mesh_it, matl)
+    K_theta = elemental_nodal_to_nodal_field(K_theta_en, mesh_it.connectivity)   # full field, for plots
+    # gradient w.r.t. the layer theta: average over the layer elements only, so
+    # interface nodes do not pick up the background elements' dC/dtheta
+    K_theta_layer = np.zeros_like(K_theta)
+    _k = elemental_nodal_to_nodal_field(K_theta_en[_roi_elems], _conn_roi)
+    K_theta_layer[:len(_k)] = _k
+
+    # ── Diagnostics for DIAG_EVENT: synthetic gather, DIAG_RECEIVER adjoint source
+    u_syn = extract_data(sim_name, DIAG_EVENT, receiver_field='displacement')
+    event_misfit = sn.EventMisfit(
+        observed_event=p.waveforms.get(data_name=obs_simulation, events=DIAG_EVENT)[0],
+        synthetic_event=p.waveforms.get(data_name=sim_name, events=DIAG_EVENT)[0],
+        misfit_function="L2",
+        receiver_field="displacement",
+    )
+    _diag_name = next(r for r in event_misfit.receiver_name_list if r.split('.')[1] == DIAG_STATION)
+    adj = event_misfit.get_misfit_and_adjoint_source_for_receiver(_diag_name)
+    # Salvus stores -(u - d) * dt; plot the continuous adjoint force d - u
+    f_adj = adj['adjoint_sources'].values.astype(float) / (1.0 / sampling_rate_in_hertz)
+    _diag_cache.update(u_syn=u_syn, f_adj=f_adj, K_theta=K_theta, K_roi=K_theta[roi_mask])
+
+    # ── 4. Fresnel-zone mask, then project onto the layered theta(y) space ─
+    # K_theta is a pointwise kernel density [misfit / rad / m^2]; the discrete
+    # gradient is d chi / d theta_i = K_theta(x_i) * M_i with the lumped nodal
+    # mass M_i (FemMassMatrix: assembled quadrature weight * |J|, no density),
+    # restricted to the layer elements' share. Without it pred = -g.dm is
+    # ~1/M ~ 1e9 too large, rho ~ 0 and every step is rejected.
+    # The model is theta(y) (x-averaged), so the gradient must be too: sum
+    # K_theta * M over each y-level inside the Fresnel zone and spread it over
+    # the level's nodes, so that -g.dm is the first-order misfit change of a
+    # uniform level update dm.
+    # The level masses follow the GLL weights (ratio ~3.6 between neighbouring
+    # node rows), so g itself zigzags in y; W (level mass per node) is kept for
+    # the L-BFGS preconditioner W^-1, whose direction W^-1 g is the smooth
+    # mass-weighted mean of K_theta per level.
+    M_nodal = np.zeros(base_mesh.npoint)
+    M_nodal[base_mesh.connectivity] = gradient_C.element_nodal_fields['FemMassMatrix']
+    M_roi = (M_nodal * _layer_frac)[roi_mask]
+    grad_nodes = K_theta_layer[roi_mask] * M_roi
+    grad = np.zeros_like(grad_nodes)
+    W = np.zeros_like(grad_nodes)
+    for yv in np.unique(_y_round_roi):
+        level = _y_round_roi == yv
+        sensed = level & _ellipse_roi
+        W[level] = M_roi[level].sum() / level.sum()
+        if sensed.any():
+            grad[level] = grad_nodes[sensed].sum() / level.sum()
+    _W_roi[0] = np.maximum(W, W.max() * 1e-6)   # guard against zero-mass levels
+
+    # ── 5. Illumination profile E(y) -> preconditioner 1/E (first call of a stage)
+    # |K_theta| (not K_theta) is averaged: the kernel oscillates in x and would cancel.
+    # Kept fixed for the whole stage so L-BFGS sees one consistent metric.
+    if PRECOND_ILLUMINATION and _P_roi[0] is None:
+        abs_nodes = np.abs(K_theta_layer[roi_mask]) * M_roi
+        levels = np.unique(_y_round_roi)
+        E = np.zeros(len(levels))
+        for j, yv in enumerate(levels):
+            sensed = (_y_round_roi == yv) & _ellipse_roi
+            if sensed.any():
+                E[j] = abs_nodes[sensed].sum() / max(M_roi[sensed].sum(), 1e-300)
+        E = gaussian_filter1d(E, sigma=PRECOND_SMOOTH_Y / np.diff(levels).mean())
+        E = np.maximum(E, PRECOND_WATER_LEVEL * E.max())
+        P = np.zeros_like(grad)
+        for j, yv in enumerate(levels):
+            P[_y_round_roi == yv] = E.max() / E[j]   # 1 at the best-lit level
+        _P_roi[0] = P
+        np.save(FWI_DATA_DIR / f"illumination_profile_alpha_{alpha}.npy", np.column_stack([levels, E]))
+        print(f"  [precond] illumination 1/E(y): range [{P.min():.2f}, {P.max():.2f}]")
+
+    label = 'grad' if ls == 0 else f'ls_{ls}'
+    print(f"  iter {it:3d} {label:6s} | misfit = {misfit_total:.6e}"
+          f" | |g| max = {np.abs(grad).max():.3e}")
+    return misfit_total, grad
+
+
+# =============================================================================
+# L-BFGS + trust region
+# =============================================================================
+
+def run_lbfgs_trust_region(max_iter=10, max_tries=10, M=10,
+                           delta_tr_init=DELTA_TR_INIT, delta_max=DELTA_TR_MAX,
+                           eta1=0.0001, eta2=0.75,
+                           gamma1=0.5, gamma2=0.9, sigma=2.0,
+                           theta_init=None):
+    """
+    L-BFGS + trust region FWI optimizer for theta [rad] (see the acoustic script).
+
+    Steps and radii are in radians (L-inf ball). The update is smoothed in y
+    through the L-BFGS initial inverse Hessian H0 = P^1/2 G P^1/2 (P =
+    illumination preconditioner 1/E(y), G = Gaussian, sigma =
+    UPDATE_SMOOTH_WAVELENGTHS * lambda_S of the stage). After each accepted step
+    m is projected onto the layered theta(y) space; with MODEL_SMOOTH_SIGMA > 0
+    the profile is also Gaussian-smoothed and re-evaluated, so the cached
+    misfit / gradient belong to it. `max_iter` counts accepted steps; the
+    gradient is cached across rejected steps.
+
+    `theta_init` (ROI theta, (n_roi_nodes,)) warm-starts a frequency stage;
+    defaults to the homogeneous starting theta.
+
+    Returns
+    -------
+    misfit_history    : list[float],              length n_accepted + 1
+    model_history     : (n_accepted + 1, n_roi_nodes)     theta [rad]
+    synthetic_history : (n_accepted + 1, 2 n_rx, n_time)  DIAG_EVENT synthetic gather
+                        (traces ordered as the waveform xarray: receiver, then X / Y)
+    adjoint_history   : (n_accepted + 1, 2, n_time)       DIAG_RECEIVER adjoint source (X, Y)
+    """
+    print(f"Starting L-BFGS trust-region optimization: "
+          f"max_iter={max_iter}, max_tries={max_tries}, M={M}")
+
+    def _mesh_theta_roi(theta_roi_vals):
+        """ROI theta after the full-mesh x-averaging applied in objective()."""
+        _t = _theta_bg_nodal.copy()
+        _t[roi_mask] = theta_roi_vals
+        return np.clip(_average_theta_in_x(_t)[roi_mask], THETA_MIN, THETA_MAX)
+
+    def _diag_plots(it):
+        plot_fwi_diagnostics(it=it, u_obs=u_obs_dict[DIAG_EVENT], u_syn=_diag_cache['u_syn'],
+                             f_adj=_diag_cache['f_adj'], K_theta=_diag_cache['K_theta'],
+                             K_roi=_diag_cache['K_roi'])
+
+    delta_tr = delta_tr_init
+    m = (np.full(roi_mask.sum(), THETA_HOMO) if theta_init is None
+         else np.clip(theta_init, THETA_MIN, THETA_MAX))
+    s_list, y_list, rho_list = [], [], []
+    prev_grad = None
+    prev_s    = None
+
+    _fwi_iter[0] = 0
+    _fwi_ls[0]   = 0
+    _P_roi[0]    = None   # recomputed from this stage's first gradient
+
+    # Gaussian smoothing operator on the theta(y) levels, sigma in metres for this stage:
+    # G_ij = exp(-(y_i - y_j)^2 / 2 sigma^2), symmetric positive (semi)definite, so H0
+    # stays SPD and d stays a descent direction. g already carries the level mass
+    # (g = K_theta * M, the quadrature weight), so G g is the Gaussian-weighted integral
+    # of K_theta and comes out smooth. No W^-1 factor: the level mass zigzags with the
+    # GLL weights (element-boundary rows get mass from two elements) and W^-1/2 on the
+    # outside would print that zigzag back onto every update.
+    _levels    = np.unique(_y_round_roi)
+    _level_idx = np.searchsorted(_levels, _y_round_roi)
+    _n_per_lvl = np.bincount(_level_idx)
+    sigma_upd  = UPDATE_SMOOTH_WAVELENGTHS * VS_0deg / f_c
+    _G         = np.exp(-0.5 * ((_levels[:, None] - _levels[None, :]) / sigma_upd) ** 2)
+    _G        /= _G.sum(axis=1).max()
+    print(f"  update smoothing: sigma = {sigma_upd * mm:.3f} mm "
+          f"({sigma_upd / np.diff(_levels).mean():.1f} mean y-levels)")
+
+    def _apply_H0(q):
+        """Initial inverse Hessian: P^1/2 G P^1/2 q (illumination 1/E(y), Gaussian in y)."""
+        sP = np.sqrt(_P_roi[0]) if _P_roi[0] is not None else np.ones_like(q)
+        v = np.bincount(_level_idx, weights=sP * q) / _n_per_lvl   # level values
+        return sP * (_G @ v)[_level_idx]
+
+    # Starting model = iteration-0 baseline (seeds all histories together)
+    print("  evaluating objective() for the starting model (iteration 0 baseline) ...")
+    misfit0, grad0 = objective(m)
+
+    misfit_history    = [float(misfit0)]
+    model_history     = [_mesh_theta_roi(m)]
+    synthetic_history = [np.array(_diag_cache['u_syn'])]
+    adjoint_history   = [np.array(_diag_cache['f_adj'])]
+    cached_misfit, cached_grad = misfit0, grad0
+    _diag_plots(0)
+
+    k     = 0   # accepted iteration counter
+    tries = 0   # total attempt counter
+
+    while k < max_iter and tries < max_tries:
+        tries += 1
+        _fwi_iter[0] = k
+        _fwi_ls[0]   = 0
+
+        print(f"\n--- L-BFGS attempt {tries} (accepted so far: {k}/{max_iter}) ---")
+        if cached_misfit is not None:
+            misfit, grad = cached_misfit, cached_grad
+            print("  [cache] reusing gradient from previous step")
+        else:
+            misfit, grad = objective(m)
+
+        # ── Update L-BFGS memory ────────────────────────────────────────────
+        if prev_grad is not None and prev_s is not None:
+            y_k = grad - prev_grad
+            sy  = np.dot(prev_s, y_k)
+            if sy > 0:
+                s_list.append(prev_s.copy())
+                y_list.append(y_k.copy())
+                rho_list.append(1.0 / sy)
+                if len(s_list) > M:
+                    s_list.pop(0); y_list.pop(0); rho_list.pop(0)
+
+        # ── L-BFGS two-loop recursion, H0 = gamma P^1/2 G P^1/2 (illumination
+        #    1/E(y) and Gaussian update smoothing) ─────────────────────────────
+        q, alphas = grad.copy(), []
+        for s, y, rho in zip(reversed(s_list), reversed(y_list), reversed(rho_list)):
+            a = rho * np.dot(s, q); q -= a * y; alphas.append(a)
+        gamma_h = (np.dot(s_list[-1], y_list[-1]) / np.dot(y_list[-1], _apply_H0(y_list[-1]))
+                   if s_list else 1.0)
+        r = gamma_h * _apply_H0(q)
+        for s, y, rho, a in zip(s_list, y_list, rho_list, reversed(alphas)):
+            r += s * (a - rho * np.dot(y, r))
+        d = -r
+
+        # ── Constrain step to the trust region (L-inf ball, radians) ────────
+        d_max = np.abs(d).max()
+        if d_max < 1e-30:
+            print(f"iter {k} | direction vanished — stopped"); break
+        step        = delta_tr * (d / d_max)
+        m_new       = np.clip(m + step, THETA_MIN, THETA_MAX)
+        actual_step = m_new - m
+
+        # ── Evaluate proposed model ─────────────────────────────────────────
+        _fwi_ls[0] = 1
+        print("  evaluating objective() for the trial step ...")
+        misfit_new, grad_new = objective(m_new)
+
+        # ── rho = actual / predicted reduction ──────────────────────────────
+        actual_red    = misfit - misfit_new
+        predicted_red = -np.dot(grad, actual_step)
+        rho_k = actual_red / predicted_red if abs(predicted_red) > 1e-30 else 0.0
+        step_norm = np.abs(actual_step).max()
+
+        # ── Accept / reject ─────────────────────────────────────────────────
+        if rho_k >= eta1:
+            prev_grad = grad.copy()
+
+            # Project onto theta(y), then Gaussian-smooth the depth profile
+            _t_acc      = np.clip(m_new, THETA_MIN, THETA_MAX)
+            _yv_unique  = np.unique(_y_round_roi)
+            _t_profile  = np.array([_t_acc[_y_round_roi == _yv].mean() for _yv in _yv_unique])
+            if MODEL_SMOOTH_SIGMA > 0:
+                _t_profile = gaussian_filter1d(_t_profile, sigma=MODEL_SMOOTH_SIGMA)
+            for _yv, _t_smooth in zip(_yv_unique, _t_profile):
+                _t_acc[_y_round_roi == _yv] = _t_smooth
+            m_proj = np.clip(_t_acc, THETA_MIN, THETA_MAX)
+
+            # misfit_new / grad_new belong to m_new, not to the smoothed m_proj:
+            # re-evaluate, else the next rho compares against a misfit that is too
+            # low and every later step is rejected. Keep m_new if smoothing undid
+            # the decrease.
+            if MODEL_SMOOTH_SIGMA > 0:
+                _fwi_ls[0] = 2
+                print("  evaluating objective() for the smoothed model ...")
+                _diag_new = dict(_diag_cache)
+                misfit_proj, grad_proj = objective(m_proj)
+                if misfit_proj < misfit:
+                    misfit_new, grad_new = misfit_proj, grad_proj
+                else:
+                    print(f"  [smooth] smoothing raised the misfit above the previous model "
+                          f"({misfit_proj:.3e} >= {misfit:.3e}) -> keeping the unsmoothed step")
+                    m_proj = m_new
+                    _diag_cache.update(_diag_new)
+
+            prev_s        = m_proj - m
+            m             = m_proj
+            cached_misfit = misfit_new
+            cached_grad   = grad_new
+            misfit_history.append(misfit_new)
+            model_history.append(_mesh_theta_roi(m))
+            synthetic_history.append(np.array(_diag_cache['u_syn']))
+            adjoint_history.append(np.array(_diag_cache['f_adj']))
+            status = "accepted"
+            k += 1
+            _diag_plots(k)
+        else:
+            cached_misfit = misfit
+            cached_grad   = grad
+            status = "REJECTED"
+
+        # ── Update trust-region radius (Nocedal & Wright §4.1) ──────────────
+        if rho_k < eta1:
+            delta_tr = min(delta_tr / sigma, step_norm)
+        elif rho_k > eta2 and step_norm >= gamma2 * delta_tr:
+            delta_tr = min(sigma * delta_tr, delta_max)
+        elif step_norm < gamma1 * delta_tr:
+            delta_tr = max(delta_tr / sigma, sigma * step_norm)
+
+        theta_mean = np.rad2deg(_mesh_theta_roi(m)[_ellipse_roi].mean())
+        print(f"Iteration {k}: n_events={len(event_ls)}  theta_mean={theta_mean:.2f} deg  "
+              f"chi={misfit:.6e}  ||g||={np.linalg.norm(grad):.3e}")
+        print(f"  pred={predicted_red:.3e}  ared={actual_red:.3e}  rho={rho_k:.3f}  "
+              f"||dm||_inf={np.rad2deg(step_norm):.3f} deg  "
+              f"delta_tr={np.rad2deg(delta_tr):.3f} deg  ({status})")
+
+    print(f"L-BFGS finished: {k} accepted iteration(s), {tries} total attempt(s).")
+    assert (len(misfit_history) == len(model_history) == len(synthetic_history)
+            == len(adjoint_history))
+    return (misfit_history, np.array(model_history),
+            np.array(synthetic_history), np.array(adjoint_history))
+
+
+# =============================================================================
+# Multi-frequency (multiscale) FWI driver
+# =============================================================================
+
+all_misfit_history    = []
+all_model_history     = []
+all_synthetic_history = []
+all_adjoint_history   = []
+all_observed_history  = []   # DIAG_EVENT observed traces, one per stage
+stage_boundaries      = [0]  # cumulative accepted-iteration index at the start of each stage
+stage_summary         = []   # (alpha, f_c, n_accepted)
+
+theta_warm_start = None      # None -> first stage starts from the homogeneous theta
+
+for stage_idx, (alpha, end_time_stage) in enumerate(zip(alpha_ls, end_time_ls)):
+    f_c = alpha * CENTRAL_FREQUENCY
+    # Ricker peaks at t = 0 -> start >= 1.5 periods early (no switch-on ringing).
+    # Snap start/end to the dt grid: a fractional step count makes Salvus round
+    # observed and synthetic traces to different lengths (off-by-one sample).
+    start_time_stage = -np.ceil(1.5 / f_c / time_step_in_seconds) * time_step_in_seconds
+    end_time_stage   = np.round(end_time_stage / time_step_in_seconds) * time_step_in_seconds
+    print(f"\n{'='*70}\nFrequency stage {stage_idx + 1}/{len(alpha_ls)}: "
+          f"alpha={alpha}  f_c={f_c / 1e6:.2f} MHz  "
+          f"t=[{start_time_stage * 1e6:.3f}, {end_time_stage * 1e6:.3f}] us\n{'='*70}")
+
+    event_config_fwd = sn.EventConfiguration(
+        wavelet=sn.simple_config.stf.Ricker(center_frequency=f_c),
+        waveform_simulation_configuration=sn.WaveformSimulationConfiguration(
+            start_time_in_seconds=start_time_stage,
+            end_time_in_seconds=end_time_stage,
+            time_step_in_seconds=time_step_in_seconds,
+        ),
+    )
+
+    # Observed data = true (layered) model at this stage's frequency
+    obs_simulation = f'true_model_a{stage_idx}'
+    misfit_name    = f'L2_theta_a{stage_idx}'
+    p.add_to_project(
+        sn.UnstructuredMeshSimulationConfiguration(
+            unstructured_mesh=mesh, name=obs_simulation, event_configuration=event_config_fwd,
+        ),
+        overwrite=True,
+    )
+    p.add_to_project(
+        sn.MisfitConfiguration(
+            name=misfit_name,
+            observed_data=f"SYNTHETIC_DATA:{obs_simulation}",
+            misfit_function="L2",
+            receiver_field="displacement",
+        ),
+        overwrite=True,
+    )
+
+    t0 = datetime.now()
+    forward_simulation(obs_simulation, event_ls)
+    elapsed = (datetime.now() - t0).total_seconds()
+    print(f"Stage {stage_idx} observed data done in {int(elapsed // 60)}m {elapsed % 60:.1f}s")
+
+    u_obs_dict = {ev: extract_data(obs_simulation, ev, receiver_field='displacement')
+                  for ev in event_ls}
+
+    # Fresnel-zone mask: margin = half a P wavelength at this stage's frequency
+    fresnel_margin = 0.5 * VP_0deg / f_c
+    _ellipse_roi = _ellipse_mask(_x_roi, _y_roi, sr_pairs, fresnel_margin)
+    print(f"Stage {stage_idx} ellipse mask: {_ellipse_roi.sum()} / {roi_mask.sum()} "
+          f"ROI nodes inside the Fresnel zone (margin {fresnel_margin * mm:.2f} mm)")
+
+    (misfit_history_stage, model_history_stage,
+     synthetic_history_stage, adjoint_history_stage) = run_lbfgs_trust_region(
+        max_iter=MAX_ITER_PER_STAGE, theta_init=theta_warm_start,
+    )
+    theta_warm_start = model_history_stage[-1]
+
+    # Row 0 of later stages duplicates the previous stage's last model -> keep stage 0's only
+    _kept = slice(None) if stage_idx == 0 else slice(1, None)
+    all_misfit_history.extend(misfit_history_stage[_kept])
+    all_model_history.append(model_history_stage[_kept])
+    all_synthetic_history.append(synthetic_history_stage[_kept])
+    all_adjoint_history.append(adjoint_history_stage[_kept])
+    all_observed_history.append(np.array(u_obs_dict[DIAG_EVENT]))
+    stage_boundaries.append(stage_boundaries[-1] + len(misfit_history_stage[_kept]))
+    stage_summary.append((alpha, f_c, len(misfit_history_stage[_kept])))
+
+    np.save(FWI_DATA_DIR / f"misfit_history_alpha_{alpha}.npy", np.array(misfit_history_stage))
+    np.save(FWI_DATA_DIR / f"model_history_theta_rad_alpha_{alpha}.npy", model_history_stage)
+    np.save(FWI_DATA_DIR / f"synthetic_signal_history_alpha_{alpha}.npy", synthetic_history_stage)
+    np.save(FWI_DATA_DIR / f"adjoint_signal_history_alpha_{alpha}.npy", adjoint_history_stage)
+    np.save(FWI_DATA_DIR / f"observed_signal_alpha_{alpha}.npy", np.array(u_obs_dict[DIAG_EVENT]))
+    print(f"Stage {stage_idx} (alpha={alpha}, f_c={f_c / 1e6:.2f} MHz): "
+          f"{len(misfit_history_stage)} model(s) saved.")
+
+print(f"\nMulti-frequency FWI finished: {stage_summary}")
+
+
+# =============================================================================
+# Summary figures and results
+# =============================================================================
+
+# ── Misfit chi vs iteration (log scale, one band per frequency stage) ──
+fig, ax = plt.subplots(figsize=(3.5, 2.6))
+for _k, (_alpha, _f_c, _n) in enumerate(stage_summary):
+    _lo, _hi = stage_boundaries[_k] - 0.5, stage_boundaries[_k + 1] - 0.5
+    if _k % 2 == 1:
+        ax.axvspan(_lo, _hi, color='0.93', zorder=0, linewidth=0)
+    ax.text(0.5 * (_lo + _hi), 1.0, f"{_f_c / 1e6:.1f} MHz", transform=ax.get_xaxis_transform(),
+            ha='center', va='bottom', fontsize=7)
+ax.semilogy(np.arange(len(all_misfit_history)), all_misfit_history, color=C_SYN, marker='o',
+            linewidth=1.0, markersize=3, markeredgecolor='black', markeredgewidth=0.4, zorder=3)
+ax.set_xlabel("FWI iteration")
+ax.set_ylabel(r"$\chi$")
+ax.yaxis.grid(True, which='major', **GRID_KW)
+ax.set_axisbelow(True)
+fig.tight_layout(pad=0.3)
+plt.savefig(FWI_IMAGE_DIR / "misfit_history_multiscale.png")
+save_paper_figure(fig, PAPER_FIG_DIR / "FWI_orientation_misfit_vs_iteration", dpi=600)
+plt.close(fig)
+
+_all_model_history = np.concatenate(all_model_history, axis=0)
+
+# ── Combined histories ──────────────────────────────────────────────────────
+np.save(FWI_DATA_DIR / "misfit_history_multiscale.npy", np.array(all_misfit_history))
+np.save(FWI_DATA_DIR / "model_history_theta_rad_multiscale.npy", _all_model_history)
+# Trace length differs per stage (start/end time depend on f_c) -> one npz key per stage
+_stage_keys = [f"alpha_{_alpha}" for _alpha in alpha_ls]
+np.savez(FWI_DATA_DIR / "synthetic_signal_history_multiscale.npz",
+         **dict(zip(_stage_keys, all_synthetic_history)))
+np.savez(FWI_DATA_DIR / "adjoint_signal_history_multiscale.npz",
+         **dict(zip(_stage_keys, all_adjoint_history)))
+np.savez(FWI_DATA_DIR / "observed_signal_history_multiscale.npz",
+         **dict(zip(_stage_keys, all_observed_history)))
+print(f"Saved misfit/model/synthetic/adjoint histories ({len(all_misfit_history)} entries) "
+      f"and observed traces ({len(all_observed_history)} stage(s)) to {FWI_DATA_DIR}")
+
+
+# ── Model error vs the true model (RMS / relative theta error, profile, layers) ──
+save_model_error_figures(
+    _all_model_history, np.column_stack([_x_roi, _y_roi]), alpha_ls, np.diff(stage_boundaries),
+    CENTRAL_FREQUENCY, LAYER_INTERFACES_Y, LAYER_ANGLES_DEG, BACKGROUND_ANGLE_DEG, (x0, x1),
+    PAPER_FIG_DIR,
+)
