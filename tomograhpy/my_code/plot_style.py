@@ -62,6 +62,7 @@ MM = 1e3                            # m -> mm for plotting
 
 C_OBS, C_SYN, C_TRUE = 'red', '#0072B2', '#009E73'   # observed / synthetic / true-model curves
 C_SRC, C_REC = 'red', '#009E73'                      # source / receiver markers
+C_TRD = 'gold'                                      # transducer markers (send and receive)
 GRID_KW = dict(linewidth=0.4, color='0.85')
 
 
@@ -106,6 +107,14 @@ def plot_sources_receivers(ax, src_locations, rec_locations, legend=True):
         ax.legend(loc='upper right', framealpha=0.85, edgecolor='none', handletextpad=0.3)
 
 
+def plot_transducers(ax, locations, legend=True):
+    """Transducers (each sends and receives) as gold squares, positions in m."""
+    ax.scatter(locations[:, 0] * MM, locations[:, 1] * MM, marker='s', color=C_TRD,
+               edgecolors='k', linewidths=0.4, s=18, zorder=5, label='Transducer', clip_on=False)
+    if legend:
+        ax.legend(loc='upper right', framealpha=0.85, edgecolor='none', handletextpad=0.3)
+
+
 def orientation_from_stiffness(mesh):
     """
     Recover the nodal grain orientation from the meshed 2D stiffness tensor.
@@ -131,9 +140,12 @@ def orientation_from_stiffness(mesh):
 
 
 def plot_orientation_field(mesh, src_locations, rec_locations, extent, save_path=None,
-                           show_glyphs=True, n_glyphs=15, title=None):
+                           show_glyphs=True, n_glyphs=15, title=None, transducers=False):
     """
     Simulation configuration: orientation field of `mesh` with sources and receivers.
+
+    transducers : True -> the positions are transducers (each sends and receives): drawn once as
+                  'Transducer' from rec_locations, src_locations is ignored
 
     extent      : (x0, x1, y0, y1) of the plotted (physical) domain [m]
     show_glyphs : dashed line segments along the symmetry axis on an
@@ -169,7 +181,10 @@ def plot_orientation_field(mesh, src_locations, rec_locations, extent, save_path
         ax.add_collection(LineCollection(segs, colors='k', linewidths=0.7,
                                          linestyles=(0, (2.0, 1.5)), zorder=3))
 
-    plot_sources_receivers(ax, src_locations, rec_locations)
+    if transducers:
+        plot_transducers(ax, rec_locations)
+    else:
+        plot_sources_receivers(ax, src_locations, rec_locations)
     ax.set_xlabel('$x$ (mm)')
     ax.set_ylabel('$z$ (mm)')
     if title:
