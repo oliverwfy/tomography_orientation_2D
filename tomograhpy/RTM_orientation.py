@@ -49,6 +49,7 @@ import salvus.flow.simple_config as sc
 from salvus.material._details import material as md
 from salvus.toolbox.helpers.wavefield_output import WavefieldOutput, wavefield_output_to_xarray
 
+from my_code.rtm_plots import save_rtm_image_figure
 from my_code.plot_style import (apply_paper_style, save_paper_figure, plot_orientation_field,
                                 plot_sources_receivers, PAPER_FIGSIZE, DOUBLE_COL, MM,
                                 C_SYN, C_TRUE, GRID_KW)
@@ -457,25 +458,9 @@ print(f"\nRTM finished in {int(elapsed // 60)}m {elapsed % 60:.0f}s")
 
 
 # =============================================================================
-# Figures: RTM images (one panel per migration model, each normalised by its 99th percentile)
+# Figures: RTM images, (a) homogeneous (b) reconstructed (c) true (my_code/rtm_plots.py)
 # =============================================================================
 
-TITLES = {'reconstructed': 'Reconstructed (FWI) model', 'true': 'True model',
-          'homogeneous': r'Homogeneous model (45$^\circ$)'}
 for tag, imgs in [("RTM_images", images), ("RTM_images_illumination_normalised", images_norm)]:
-    fig, axes = plt.subplots(1, len(MIGRATION_MODELS), figsize=(DOUBLE_COL, 2.7), sharey=True,
-                             layout='constrained')
-    axes = np.atleast_1d(axes)
-    for k, (ax, name) in enumerate(zip(axes, MIGRATION_MODELS)):
-        img = imgs[name] / (np.percentile(np.abs(imgs[name]), 99.0) or 1.0)
-        tp = ax.pcolormesh(x_img * MM, y_img * MM, img, cmap='RdBu', vmin=-1, vmax=1,
-                           shading='auto', rasterized=True)
-        draw_defects(ax)
-        plot_sources_receivers(ax, tx_location[None, :], r_loc_all, legend=(k == 0))
-        ax.set_xlim(x0 * MM, x1 * MM); ax.set_ylim(y0 * MM, y1 * MM); ax.set_aspect('equal')
-        ax.set_xlabel('$x$ (mm)')
-        ax.set_title(f'({"abc"[k]}) {TITLES[name]}', loc='left')
-    axes[0].set_ylabel('$z$ (mm)')
-    fig.colorbar(tp, ax=axes.tolist(), shrink=0.8, label='Normalised RTM amplitude')
-    save_paper_figure(fig, PAPER_FIG_DIR / tag)
-    plt.close(fig)
+    save_rtm_image_figure(imgs, x_img, y_img, tx_location[None, :], r_loc_all, defect_nodes,
+                          (x0, x1, y0, y1), PAPER_FIG_DIR / tag)
