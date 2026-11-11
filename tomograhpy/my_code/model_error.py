@@ -13,6 +13,10 @@ Figures (project journal format, my_code/plot_style.py):
   model_error_layers      : mean +- std of theta in each layer vs the true value
 Interior RMS and interface depths are printed only.
 
+Polycrystal (Voronoi) models, not layered: save_grain_model_error_figures(...) gives the same
+convergence figure plus model_error_maps (true / recovered theta) and model_error_grains
+(mean +- std per grain), with the metrics evaluated node by node, weighted by the nodal area.
+
 Metrics (inside the physical x range, rows exactly on an interface excluded):
   * error  d = wrap(theta - theta_true) into [-90, 90) deg (orientation is 180-deg periodic)
   * RMS    sqrt(sum w d^2 / sum w), w = thickness of each depth row (area weighting; GLL rows
@@ -23,7 +27,8 @@ Metrics (inside the physical x range, rows exactly on an interface excluded):
 import numpy as np
 import matplotlib.pyplot as plt
 
-from my_code.plot_style import (apply_paper_style, save_paper_figure, SINGLE_COL, PAPER_FIGSIZE, MM,
+from my_code.plot_style import (apply_paper_style, save_paper_figure, add_colorbar, SINGLE_COL,
+                                DOUBLE_COL, PAPER_FIGSIZE, MM,
                                 C_SYN, C_TRUE, GRID_KW)
 
 
@@ -39,6 +44,26 @@ def true_theta(z, interfaces_y, layer_angles_deg, background_deg):
         t[(z < top) & (z > bot)] = a
     t[np.min(np.abs(z[:, None] - np.asarray(interfaces_y)[None, :]), axis=1) < 1e-9] = np.nan
     return t
+
+
+def _save_convergence_figure(rms_all, stage_alphas, bounds, central_frequency, out_dir):
+    """model_error_convergence: RMS vs iteration, relative error RMS / RMS_0 on the right axis."""
+    fig, ax = plt.subplots(figsize=(SINGLE_COL, 2.6), layout='constrained')
+    for k, a in enumerate(stage_alphas):
+        lo, hi = bounds[k] - 0.5, bounds[k + 1] - 0.5
+        if k % 2 == 1:
+            ax.axvspan(lo, hi, color='0.93', zorder=0, lw=0)
+        ax.text(0.5 * (lo + hi), 1.0, f"{a * central_frequency / 1e6:.1f} MHz",
+                transform=ax.get_xaxis_transform(), ha='center', va='bottom', fontsize=7)
+    ax.plot(np.arange(len(rms_all)), rms_all, color=C_SYN, marker='o', ms=2.5, lw=0.9)
+    ax.set_xlabel('FWI iteration'); ax.set_ylabel(r'RMS $\theta$ error (deg)')
+    ax.set_ylim(0, 1.05 * rms_all[0])
+    ax.yaxis.grid(True, **GRID_KW)
+    ax_rel = ax.secondary_yaxis('right', functions=(lambda r: r / rms_all[0], lambda q: q * rms_all[0]))
+    ax_rel.set_ylabel(r'$\|\theta - \theta_\mathrm{true}\| \,/\, \|\theta_0 - \theta_\mathrm{true}\|$')
+    ax.spines['right'].set_visible(True)
+    save_paper_figure(fig, out_dir / 'model_error_convergence')
+    plt.close(fig)
 
 
 def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_counts,
@@ -91,7 +116,6 @@ def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_coun
                      if np.ptp(p[valid]) > 0 and np.ptp(t_true[valid]) > 0 else np.nan
                      for p in profiles])
     bounds = np.concatenate([[0], np.cumsum(stage_counts)])
-    it = np.arange(len(models))
 
     # ── per-layer statistics and inner-interface depths of the final model ──
     final = profiles[-1]
@@ -126,22 +150,7 @@ def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_coun
         print(f"interface {t * MM:5.2f} mm -> recovered {e * MM:5.2f} mm ({(e - t) * MM:+.2f})")
 
     # ── 1. convergence: RMS, relative error on the right axis (= RMS / RMS_0) ──
-    fig, ax = plt.subplots(figsize=(SINGLE_COL, 2.6), layout='constrained')
-    for k, a in enumerate(stage_alphas):
-        lo, hi = bounds[k] - 0.5, bounds[k + 1] - 0.5
-        if k % 2 == 1:
-            ax.axvspan(lo, hi, color='0.93', zorder=0, lw=0)
-        ax.text(0.5 * (lo + hi), 1.0, f"{a * central_frequency / 1e6:.1f} MHz",
-                transform=ax.get_xaxis_transform(), ha='center', va='bottom', fontsize=7)
-    ax.plot(it, rms_all, color=C_SYN, marker='o', ms=2.5, lw=0.9)
-    ax.set_xlabel('FWI iteration'); ax.set_ylabel(r'RMS $\theta$ error (deg)')
-    ax.set_ylim(0, 1.05 * rms_all[0])
-    ax.yaxis.grid(True, **GRID_KW)
-    ax_rel = ax.secondary_yaxis('right', functions=(lambda r: r / rms_all[0], lambda q: q * rms_all[0]))
-    ax_rel.set_ylabel(r'$\|\theta - \theta_\mathrm{true}\| \,/\, \|\theta_0 - \theta_\mathrm{true}\|$')
-    ax.spines['right'].set_visible(True)
-    save_paper_figure(fig, out_dir / 'model_error_convergence')
-    plt.close(fig)
+    _save_convergence_figure(rms_all, stage_alphas, bounds, central_frequency, out_dir)
 
     # ── 2. final theta(z): recovered vs true vs starting ─────────────────────
     fig, ax = plt.subplots(figsize=PAPER_FIGSIZE, layout='constrained')
@@ -174,3 +183,123 @@ def save_model_error_figures(model_history_rad, roi_xy, stage_alphas, stage_coun
 
     return dict(rms=rms_all, rms_interior=rms_int, relative=rel_err, mae=mae, max=max_err,
                 corr=corr, layers=layer_rows, interfaces=iface)
+
+
+def save_grain_model_error_figures(model_history_rad, node_xy, node_area, grain_id, theta_true_deg,
+                                   stage_alphas, stage_counts, central_frequency, extent, out_dir,
+                                   interior_margin=0.25e-3):
+    """
+    Model-error metrics and figures of an FWI run against a true polycrystal (Voronoi grains).
+
+    Same metrics as save_model_error_figures, evaluated node by node instead of per depth row
+    (the model is not layered): wrap-aware error, area-weighted by the nodal area `node_area`.
+
+    model_history_rad : (n_models, n_nodes) theta [rad] of every saved model, multiscale order
+    node_xy           : (n_nodes, 2) node coordinates [m]
+    node_area         : (n_nodes,) area belonging to each node [m^2] (lumped mass, no density)
+    grain_id          : (n_nodes,) true grain of each node (0 = largest)
+    theta_true_deg    : (n_nodes,) true theta [deg]
+    extent            : (x0, x1, y0, y1) physical domain [m]
+
+    Figures in `out_dir`:
+      model_error_convergence : RMS theta error vs iteration, relative error on the right axis
+      model_error_maps        : (a) true and (b) recovered theta field
+      model_error_grains      : mean +- std of theta in each grain vs the true value
+    The grain-interior RMS (nodes >= interior_margin from a grain boundary) is printed only.
+    """
+    from scipy.spatial import cKDTree
+
+    apply_paper_style()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    models = np.rad2deg(np.asarray(model_history_rad))
+    assert sum(stage_counts) == len(models), (stage_counts, models.shape)
+    w = np.asarray(node_area, dtype=float)
+    n_grain = int(grain_id.max()) + 1
+
+    # grain interior: no node of another grain within interior_margin
+    interior = np.ones(len(grain_id), dtype=bool)
+    for g in range(n_grain):
+        own = grain_id == g
+        if own.all():
+            continue
+        d, _ = cKDTree(node_xy[~own]).query(node_xy[own])
+        interior[np.flatnonzero(own)[d < interior_margin]] = False
+
+    def rms(d, mask):
+        return np.sqrt(np.sum(w[mask] * d[mask] ** 2) / np.sum(w[mask]))
+
+    every = np.ones(len(w), dtype=bool)
+    errors = wrap_deg(models - theta_true_deg[None, :])
+    rms_all = np.array([rms(e, every) for e in errors])
+    rms_int = np.array([rms(e, interior) for e in errors])
+    rel_err = rms_all / rms_all[0]
+    mae = np.array([np.sum(w * np.abs(e)) / np.sum(w) for e in errors])
+    max_err = np.array([np.abs(e).max() for e in errors])
+    corr = np.array([np.corrcoef(m, theta_true_deg)[0, 1] if np.ptp(m) > 0 else np.nan for m in models])
+    bounds = np.concatenate([[0], np.cumsum(stage_counts)])
+
+    # ── per-grain statistics of the final model ─────────────────────────────
+    final = models[-1]
+    grain_rows = []
+    for g in range(n_grain):
+        s = grain_id == g
+        mean = np.sum(w[s] * final[s]) / np.sum(w[s])
+        std = np.sqrt(np.sum(w[s] * (final[s] - mean) ** 2) / np.sum(w[s]))
+        grain_rows.append((g, float(np.sum(w[s]) / np.sum(w)), float(theta_true_deg[s][0]), mean, std))
+
+    # ── console summary ──────────────────────────────────────────────────────
+    print(f"\nModel error: {len(models)} models, stages alpha={list(stage_alphas)} "
+          f"({[int(c) for c in stage_counts]} models)")
+    print(f"{'':10s} {'RMS':>7s} {'interior':>9s} {'MAE':>7s} {'max':>7s} {'rel.err':>8s} {'corr':>6s}")
+    for name, i in [('start', 0)] + [(f'end a={a}', b - 1) for a, b in zip(stage_alphas, bounds[1:])]:
+        print(f"{name:10s} {rms_all[i]:7.2f} {rms_int[i]:9.2f} {mae[i]:7.2f} {max_err[i]:7.1f} "
+              f"{rel_err[i]:8.3f} {corr[i]:6.3f}")
+    print("grain  area (%)  true   mean +- std  [deg]")
+    for g, a, t, mean, std in grain_rows:
+        print(f"G{g + 1:<4d} {100 * a:7.1f}  {t:5.1f}  {mean:5.1f} +- {std:4.1f}")
+
+    # ── 1. convergence ───────────────────────────────────────────────────────
+    _save_convergence_figure(rms_all, stage_alphas, bounds, central_frequency, out_dir)
+
+    # ── 2. true and recovered theta field ────────────────────────────────────
+    x0, x1, y0, y1 = extent
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COL, 3.0), sharey=True, layout='constrained')
+    for k, (ax, field, name) in enumerate(zip(axes, [theta_true_deg, final], ['True', 'Recovered'])):
+        tp = ax.tripcolor(node_xy[:, 0] * MM, node_xy[:, 1] * MM, field, cmap='viridis',
+                          vmin=0.0, vmax=90.0, shading='gouraud', rasterized=True)
+        ax.set_xlim(x0 * MM, x1 * MM); ax.set_ylim(y0 * MM, y1 * MM); ax.set_aspect('equal')
+        ax.set_xlabel('$x$ (mm)')
+        ax.set_title(f'({"ab"[k]}) {name}', loc='left')
+        add_colorbar(fig, ax, tp, r'$\theta$ (deg)')
+    axes[0].set_ylabel('$z$ (mm)')
+    save_paper_figure(fig, out_dir / 'model_error_maps')
+    plt.close(fig)
+
+    # ── 3. per-grain recovery ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=PAPER_FIGSIZE, layout='constrained')
+    if n_grain <= 20:
+        # few grains: true and recovered bars side by side, one pair per grain
+        k = np.arange(1, n_grain + 1)
+        ax.bar(k - 0.18, [r[2] for r in grain_rows], width=0.36, color=C_TRUE, alpha=0.8, label='True')
+        ax.bar(k + 0.18, [r[3] for r in grain_rows], width=0.36, color=C_SYN, alpha=0.8,
+               yerr=[r[4] for r in grain_rows], error_kw=dict(lw=0.6, capsize=2),
+               label=r'Recovered (mean $\pm$ std)')
+        ax.set_xticks(k, [f'G{i}' for i in k])
+        ax.set_xlabel('Grain (largest to smallest)'); ax.set_ylabel(r'$\theta$ (deg)')
+        ax.set_ylim(0, 90)
+        ax.legend(frameon=False, loc='upper right'); ax.yaxis.grid(True, **GRID_KW)
+    else:
+        # many grains: recovered mean +- std vs the true value, one point per grain
+        t, m, s = (np.array([r[i] for r in grain_rows]) for i in (2, 3, 4))
+        lo, hi = 5 * np.floor(min(t.min(), (m - s).min()) / 5), 5 * np.ceil(max(t.max(), (m + s).max()) / 5)
+        ax.plot([lo, hi], [lo, hi], color=C_TRUE, ls='--', lw=0.8, label='Recovered = true')
+        ax.errorbar(t, m, yerr=s, fmt='o', color=C_SYN, ms=2.5, lw=0.6, capsize=1.5,
+                    label=r'Recovered (mean $\pm$ std)')
+        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect('equal')
+        ax.set_xlabel(r'True $\theta$ (deg)'); ax.set_ylabel(r'Recovered $\theta$ (deg)')
+        ax.legend(frameon=False, loc='upper left'); ax.grid(True, **GRID_KW)
+    save_paper_figure(fig, out_dir / 'model_error_grains')
+    plt.close(fig)
+
+    return dict(rms=rms_all, rms_interior=rms_int, relative=rel_err, mae=mae, max=max_err,
+                corr=corr, grains=grain_rows)

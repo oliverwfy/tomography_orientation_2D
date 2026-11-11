@@ -52,5 +52,10 @@ When an FWI run finishes, it saves the model-error figures with
 - `model_error_layers`: mean +- std of theta per layer vs the true value. Do not plot interface-depth
   errors (interior RMS and interface depths are printed to the console only).
 
+Voronoi (polycrystal) FWI uses `save_grain_model_error_figures(...)` instead: the same
+`model_error_convergence`, plus `model_error_maps` (true / recovered theta) and
+`model_error_grains` (mean +- std per grain vs the true value: bars for <= 20 grains, a recovered-vs-true
+scatter with a 1:1 line for more), node-wise, weighted by nodal area.
+
 Metrics: wrap-aware difference (180-deg periodic), area-weighted by depth-row thickness, inside the
 physical x range. `plot_model_error.py` redraws the figures from a saved run.

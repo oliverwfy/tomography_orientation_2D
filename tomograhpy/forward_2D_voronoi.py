@@ -19,6 +19,9 @@ Workflow
    receive (the 8 others on the transmitting side are inactive).
 6. Forward simulation of that one event (displacement at the receiving transducers), traces saved,
    figures in the project journal format.
+7. Mesh convergence (RUN_CONVERGENCE): the same event on meshes built for CONVERGENCE_FACTORS x the
+   centre frequency (coarse -> fine); relative L2 error of the received traces against the finest
+   mesh and a trace overlay (paper_figures/voronoi_mesh_convergence).
 
 Run from the tomograhpy folder:
     python forward_2D_voronoi.py
@@ -108,6 +111,12 @@ model_order             = 4
 reference_frequency     = CENTRAL_FREQUENCY * 2
 number_of_wavelengths   = 3
 free_surfaces           = ['x0', 'x1', 'y0', 'y1']   # finite specimen: transducers on every side
+
+# Mesh convergence: the same event on meshes built for reference_frequency = factor * CENTRAL_FREQUENCY
+# (coarse -> fine, elements_per_wavelength and model_order fixed); traces compared with the finest
+# mesh. The main mesh (and the FWI) uses factor 2.
+RUN_CONVERGENCE     = True
+CONVERGENCE_FACTORS = [1.0, 1.5, 2.0, 3.0, 4.0]
 
 # 36 transducers, 9 per side at 1 ... 9 mm, ordered bottom, top, left, right. One event: the transducer
 # FIRING_INDEX (0-8 along the side) on FIRING_SIDE transmits a force normal to its side (unit normal
@@ -278,26 +287,49 @@ p = sn.Project.from_domain(path=Path(PROJECT_DIR_WIN, PROJECT_NAME), domain=doma
 material_unoriented = sn.material.elastic.hexagonal.TensorComponents.from_params(**matl.VTI_parameters())
 matl_mean = oriented_material(material_unoriented, THETA_MEAN_DEG)   # mesh sizing only (rotation-invariant)
 
-ab_params = salvus.mesh.simple_mesh.basic_mesh.AbsorbingBoundaryParameters(
-    free_surface=free_surfaces, number_of_wavelengths=number_of_wavelengths,
-    reference_velocity=VP_0deg, reference_frequency=reference_frequency)
-mesh_res = sn.MeshResolution(reference_frequency=reference_frequency,
-                             elements_per_wavelength=elements_per_wavelength, model_order=model_order)
-mesh = lm.mesh_from_domain(domain=domain,
-                           # all 4 sides free -> no absorbing layer (an empty one leaves a '' side
-                           # set that Salvus rejects at launch)
-                           model=sn.layered_meshing.MeshingProtocol(
-                               lm.LayeredModel([matl_mean]),
-                               ab=None if len(free_surfaces) == 4 else ab_params),
-                           mesh_resolution=mesh_res)
+def build_voronoi_mesh(reference_frequency):
+    """
+    Box mesh resolving `reference_frequency` (elements_per_wavelength, model_order), every GLL node
+    set to the rotated stiffness of the grain it lies in; time step 90 % of the CFL limit.
 
-# every GLL node: grain id from the PNG -> theta of that grain -> rotated stiffness
-_nodes = mesh.get_element_nodes()                                # (nelem, n_gll, 2)
-grain_en = grain_ids_of_points(indexer, _nodes)                  # (nelem, n_gll)
-theta_en_deg = theta_grain_deg[grain_en]
-C = stiffness_from_theta(np.deg2rad(theta_en_deg), matl)
-for k in STIFFNESS_PARAMETERS:
-    mesh.element_nodal_fields[k][:] = C[k]
+    Returns mesh, grain id per GLL node (nelem, n_gll), time step [s], CFL time step [s].
+    """
+    ab_params = salvus.mesh.simple_mesh.basic_mesh.AbsorbingBoundaryParameters(
+        free_surface=free_surfaces, number_of_wavelengths=number_of_wavelengths,
+        reference_velocity=VP_0deg, reference_frequency=reference_frequency)
+    mesh_res = sn.MeshResolution(reference_frequency=reference_frequency,
+                                 elements_per_wavelength=elements_per_wavelength, model_order=model_order)
+    mesh = lm.mesh_from_domain(domain=domain,
+                               # all 4 sides free -> no absorbing layer (an empty one leaves a '' side
+                               # set that Salvus rejects at launch)
+                               model=sn.layered_meshing.MeshingProtocol(
+                                   lm.LayeredModel([matl_mean]),
+                                   ab=None if len(free_surfaces) == 4 else ab_params),
+                               mesh_resolution=mesh_res)
+
+    # every GLL node: grain id from the PNG -> theta of that grain -> rotated stiffness
+    grain_en = grain_ids_of_points(indexer, mesh.get_element_nodes())   # (nelem, n_gll)
+    C = stiffness_from_theta(np.deg2rad(theta_grain_deg[grain_en]), matl)
+    for k in STIFFNESS_PARAMETERS:
+        mesh.element_nodal_fields[k][:] = C[k]
+
+    # time step: 90 % of the CFL limit (fastest qP bounded by the largest Voigt eigenvalue)
+    f = mesh.element_nodal_fields
+    Cv = np.stack([np.stack([f['C11'], f['C12'], f['C13']], -1),
+                   np.stack([f['C12'], f['C22'], f['C23']], -1),
+                   np.stack([f['C13'], f['C23'], f['C33']], -1)], -2)
+    v_max = np.sqrt(np.linalg.eigvalsh(Cv)[..., -1] / f['RHO']).max(axis=1)
+    dt_cfl = mesh.compute_time_step(max_velocity=v_max)[0]
+    return mesh, grain_en, np.floor(0.9 * dt_cfl * 1e11) / 1e11, dt_cfl
+
+
+def snapped_time_window(dt):
+    """Simulation start / end time snapped to the dt grid (an integer number of steps)."""
+    return np.floor(START_TIME / dt) * dt, np.round(END_TIME / dt) * dt
+
+
+START_TIME, END_TIME = start_time, end_time                     # before snapping to a mesh's dt
+mesh, grain_en, time_step_in_seconds, _dt_cfl = build_voronoi_mesh(reference_frequency)
 print(f"Mesh: {mesh.nelem} elements, {mesh.npoint} nodes; grains per GLL node: "
       f"{np.bincount(grain_en.ravel(), minlength=n_grains_found).tolist()}")
 
@@ -306,16 +338,7 @@ _C_check = stiffness_from_theta(np.deg2rad(THETA_MEAN_DEG), matl)
 for k in STIFFNESS_PARAMETERS:
     assert np.isclose(_C_check[k], getattr(matl_mean, k).p, rtol=1e-9, atol=1e-3), k
 
-# time step: 90 % of the CFL limit (fastest qP bounded by the largest Voigt eigenvalue)
-_f = mesh.element_nodal_fields
-_Cv = np.stack([np.stack([_f['C11'], _f['C12'], _f['C13']], -1),
-                np.stack([_f['C12'], _f['C22'], _f['C23']], -1),
-                np.stack([_f['C13'], _f['C23'], _f['C33']], -1)], -2)
-_v_max = np.sqrt(np.linalg.eigvalsh(_Cv)[..., -1] / _f['RHO']).max(axis=1)
-_dt_cfl = mesh.compute_time_step(max_velocity=_v_max)[0]
-time_step_in_seconds = np.floor(0.9 * _dt_cfl * 1e11) / 1e11
-start_time = np.floor(start_time / time_step_in_seconds) * time_step_in_seconds
-end_time   = np.round(end_time / time_step_in_seconds) * time_step_in_seconds
+start_time, end_time = snapped_time_window(time_step_in_seconds)
 print(f"CFL {_dt_cfl * 1e9:.3f} ns -> dt {time_step_in_seconds * 1e9:.2f} ns, "
       f"t = [{start_time * 1e6:.2f}, {end_time * 1e6:.2f}] us")
 
@@ -360,23 +383,29 @@ plt.close(fig)
 # Forward simulation
 # =============================================================================
 
+def add_simulation(name, mesh, dt):
+    """Simulation configuration `name`: Ricker at CENTRAL_FREQUENCY on `mesh` with time step dt."""
+    t0, t1 = snapped_time_window(dt)
+    p.add_to_project(sn.UnstructuredMeshSimulationConfiguration(
+        unstructured_mesh=mesh, name=name,
+        event_configuration=sn.EventConfiguration(
+            wavelet=sn.simple_config.stf.Ricker(center_frequency=CENTRAL_FREQUENCY),
+            waveform_simulation_configuration=sn.WaveformSimulationConfiguration(
+                start_time_in_seconds=t0, end_time_in_seconds=t1, time_step_in_seconds=dt))),
+        overwrite=True)
+
+
 SIM_NAME = "forward_voronoi"
-p.add_to_project(sn.UnstructuredMeshSimulationConfiguration(
-    unstructured_mesh=mesh, name=SIM_NAME,
-    event_configuration=sn.EventConfiguration(
-        wavelet=sn.simple_config.stf.Ricker(center_frequency=CENTRAL_FREQUENCY),
-        waveform_simulation_configuration=sn.WaveformSimulationConfiguration(
-            start_time_in_seconds=start_time, end_time_in_seconds=end_time,
-            time_step_in_seconds=time_step_in_seconds))), overwrite=True)
+add_simulation(SIM_NAME, mesh, time_step_in_seconds)
 
 print(f"Event {EVENT}: transducer at ({tx_locations[0, 0] * MM:.0f}, {tx_locations[0, 1] * MM:.0f}) mm "
       f"transmits, {len(r_loc_all)} transducers on the other 3 sides receive")
 forward_simulation(SIM_NAME, event_ls)                             # traces at the transducers only
 
 
-def receiver_traces(event):
+def receiver_traces(event, sim_name=SIM_NAME):
     """Displacement traces (n_rx, 2, n_t) of one event, rows ordered as r_loc_all, components (x, z)."""
-    d = p.waveforms.get(data_name=SIM_NAME, events=event)[0].get_waveform_data_xarray(
+    d = p.waveforms.get(data_name=sim_name, events=event)[0].get_waveform_data_xarray(
         receiver_field='displacement')
     return np.stack([np.stack([d.sel(receiver_id=f"XX.R{j + 1}.", component=c).values.squeeze()
                                for c in ('X', 'Y')]) for j in range(len(r_loc_all))]), d.time.values
@@ -409,3 +438,79 @@ axes[0].set_ylabel(r'Time ($\mu$s)')
 axes[0].invert_yaxis()
 save_paper_figure(fig, PAPER_FIG_DIR / "voronoi_transducer_gather")
 plt.close(fig)
+
+
+# =============================================================================
+# Mesh convergence: the same event on meshes resolving reference_frequency = factor * CENTRAL_FREQUENCY,
+# coarse -> fine. Traces are interpolated onto the time axis of the finest mesh (the reference) and
+# compared through the relative L2 error over all receiving transducers and both components.
+# =============================================================================
+
+if RUN_CONVERGENCE:
+    conv = {}
+    for fac in CONVERGENCE_FACTORS:
+        if np.isclose(fac * CENTRAL_FREQUENCY, reference_frequency):    # the main mesh: already simulated
+            conv[fac] = dict(traces=traces, time=t_rx, nelem=mesh.nelem, dt=time_step_in_seconds)
+            continue
+        mesh_k, _, dt_k, _ = build_voronoi_mesh(fac * CENTRAL_FREQUENCY)
+        name = f"forward_voronoi_conv_{fac:g}"
+        add_simulation(name, mesh_k, dt_k)
+        print(f"Convergence: mesh for {fac:g} f_c = {fac * CENTRAL_FREQUENCY / 1e6:.1f} MHz, "
+              f"{mesh_k.nelem} elements, dt {dt_k * 1e9:.2f} ns")
+        forward_simulation(name, event_ls)
+        tr_k, t_k = receiver_traces(EVENT, name)
+        conv[fac] = dict(traces=tr_k, time=t_k, nelem=mesh_k.nelem, dt=dt_k)
+
+    fac_ref = max(CONVERGENCE_FACTORS)
+    t_ref, u_ref = conv[fac_ref]['time'], conv[fac_ref]['traces']
+
+    def on_reference_time(c):
+        """Traces of one mesh interpolated onto t_ref (zero outside their own time window)."""
+        return np.stack([np.stack([np.interp(t_ref, c['time'], c['traces'][j, i], left=0.0, right=0.0)
+                                   for i in range(2)]) for j in range(c['traces'].shape[0])])
+
+    u_on_ref = {fac: on_reference_time(conv[fac]) for fac in CONVERGENCE_FACTORS}
+    rel_err = {fac: np.linalg.norm(u_on_ref[fac] - u_ref) / np.linalg.norm(u_ref)
+               for fac in CONVERGENCE_FACTORS}
+    print(f"\nMesh convergence (reference: {fac_ref:g} f_c), {elements_per_wavelength} elements per "
+          f"minimum wavelength at the mesh frequency, order {model_order}")
+    print(f"{'f_mesh/f_c':>10s} {'elements':>9s} {'dt (ns)':>8s} {'rel. L2 error':>14s}")
+    for fac in CONVERGENCE_FACTORS:
+        print(f"{fac:10g} {conv[fac]['nelem']:9d} {conv[fac]['dt'] * 1e9:8.2f} {rel_err[fac]:14.3e}")
+    np.savez_compressed(VORONOI_DATA / "voronoi_mesh_convergence.npz",
+                        factors=np.array(CONVERGENCE_FACTORS), central_frequency=CENTRAL_FREQUENCY,
+                        nelem=[conv[f]['nelem'] for f in CONVERGENCE_FACTORS],
+                        dt=[conv[f]['dt'] for f in CONVERGENCE_FACTORS],
+                        rel_err=[rel_err[f] for f in CONVERGENCE_FACTORS],
+                        time=t_ref, traces=np.stack([u_on_ref[f] for f in CONVERGENCE_FACTORS]),
+                        receiver_locs=r_loc_all)
+
+    # (a) relative error vs elements per wavelength at f_c, (b) u_z at the bottom-middle transducer
+    j_rx = np.flatnonzero(r_side == 'bottom')[len(_line) // 2]
+    epw_fc = elements_per_wavelength * np.array(CONVERGENCE_FACTORS)   # per min. wavelength at f_c
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COL, 2.8), layout='constrained')
+    tested = [f for f in CONVERGENCE_FACTORS if f != fac_ref]
+    axes[0].loglog(elements_per_wavelength * np.array(tested), [rel_err[f] for f in tested],
+                   color=C_SYN, marker='o', ms=3, lw=0.9)
+    axes[0].axvline(elements_per_wavelength * reference_frequency / CENTRAL_FREQUENCY, color='0.5',
+                    lw=0.6, ls='--', label='Mesh used (forward, FWI)')
+    axes[0].set_xticks(epw_fc[:-1], [f'{e:g}' for e in epw_fc[:-1]])
+    axes[0].minorticks_off()
+    axes[0].set_xlabel(r'Elements per minimum wavelength at $f_c$')
+    axes[0].set_ylabel(r'Relative $L_2$ error')
+    axes[0].set_title(f'(a) Convergence (reference: {elements_per_wavelength * fac_ref:g} el./$\\lambda$)',
+                      loc='left')
+    axes[0].legend(frameon=False, loc='upper right')
+    axes[0].grid(True, which='both', **GRID_KW)
+    colors = plt.cm.viridis(np.linspace(0.0, 0.85, len(tested)))
+    for f, c in zip(tested, colors):
+        axes[1].plot(t_ref * 1e6, u_on_ref[f][j_rx, 1], color=c, lw=0.8,
+                     label=f'{elements_per_wavelength * f:g} el./$\\lambda$')
+    axes[1].plot(t_ref * 1e6, u_ref[j_rx, 1], color='k', lw=0.8, ls='--',
+                 label=f'{elements_per_wavelength * fac_ref:g} el./$\\lambda$ (ref.)')
+    axes[1].set_xlabel(r'Time ($\mu$s)'); axes[1].set_ylabel('$u_z$ (m)')
+    axes[1].set_title(f'(b) $u_z$ at $x$ = {r_loc_all[j_rx, 0] * MM:g} mm (bottom)', loc='left')
+    axes[1].legend(frameon=False, loc='upper left', ncol=2)
+    axes[1].grid(True, **GRID_KW)
+    save_paper_figure(fig, PAPER_FIG_DIR / "voronoi_mesh_convergence")
+    plt.close(fig)
